@@ -1,0 +1,105 @@
+# Release — publish every public package to npm under the @toragonite scope.
+#
+# Trigger: pushing a tag matching `v*` (e.g. `v0.1.0`), which scripts/release-public.sh
+# creates. Nothing publishes on a branch push; the tag IS the release decision.
+#
+# REQUIRED REPOSITORY SECRET
+#   NPM_TOKEN — an npm "Automation" token (bypasses 2FA for CI) for an account with
+#   publish rights on the @toragonite scope. Add it under
+#   Settings → Secrets and variables → Actions. It is exposed to publish steps as
+#   NODE_AUTH_TOKEN, which is what npm reads.
+#
+# PROVENANCE
+#   Each package publishes with --provenance (signed link back to this run + commit).
+#   Requires `id-token: write` (below), a public repo, and npm >= 9.5 (Node 20 ships it).
+#
+# ORDER
+#   Packages publish in dependency (topological) order: core first, then adapters.
+#   Adapters depend on core via `^0.1.0`, which npm resolves against the registry at
+#   install time — so core must already be on the registry when an adapter publishes,
+#   or the adapter would be briefly uninstallable. Core-first is the safe order.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install
+        run: npm ci
+
+      # The tag is the release decision, but the version that reaches npm comes from
+      # package.json. If they disagree, the tag lies about what was published — fail here.
+      # Every package moves in lockstep, so each must match the tag — and this check spans
+      # all five, every one of which now publishes. A drift on any package would publish a
+      # wrong version or 404 its core dependency, so this loop guards each publish below.
+      # GITHUB_REF_NAME is a git ref this repo controls (only release-public.sh pushes v*
+      # tags), read as a shell env var — not `${{ }}`-interpolated untrusted input.
+      - name: Verify tag matches every package version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          mismatch=0
+          for pkg in core claude codex gemini cursor; do
+            pkg_version="$(node -p "require('./packages/${pkg}/package.json').version")"
+            if [ "$tag_version" != "$pkg_version" ]; then
+              echo "Tag ${GITHUB_REF_NAME} implies ${tag_version}, but packages/${pkg} is ${pkg_version}." >&2
+              mismatch=1
+            fi
+          done
+          if [ "$mismatch" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Releasing version ${tag_version}."
+
+      # All CI gates again — a tag can point at a commit that never went through a PR.
+      - name: Build
+        run: npm run build
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+
+      # One step per package: a failed publish names the package, and re-running after a
+      # partial failure is a matter of reading which steps were green.
+      - name: Publish @toragonite/agent-mesh (core)
+        run: npm publish -w @toragonite/agent-mesh --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # --- Adapters (dependency order, after core). ---
+      - name: Publish @toragonite/agent-mesh-claude
+        run: npm publish -w @toragonite/agent-mesh-claude --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @toragonite/agent-mesh-codex
+        run: npm publish -w @toragonite/agent-mesh-codex --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # gemini and cursor publish here too, still after core: every adapter depends on core
+      # via `^0.1.0`, which npm resolves against the registry at install time, so core must
+      # already be published before any adapter goes up. All five packages ship together from
+      # this workflow, in dependency order, core first.
+      - name: Publish @toragonite/agent-mesh-gemini
+        run: npm publish -w @toragonite/agent-mesh-gemini --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @toragonite/agent-mesh-cursor
+        run: npm publish -w @toragonite/agent-mesh-cursor --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

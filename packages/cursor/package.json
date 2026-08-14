@@ -1,0 +1,34 @@
+{
+  "name": "@toragonite/agent-mesh-cursor",
+  "version": "0.1.0",
+  "description": "Cursor adapter for agent-mesh — drive the official cursor-agent CLI headlessly: run, resume, stream, live model catalog, auth. Unofficial.",
+  "keywords": ["ai","agent","orchestration","cursor","cursor-agent","llm","cli","agent-mesh"],
+  "license": "MIT",
+  "author": "Toragonite",
+  "type": "module",
+  "engines": { "node": ">=18.17" },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+    }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "repository": { "type": "git", "url": "git+https://github.com/Toragonite/agent-mesh.git", "directory": "packages/cursor" },
+  "homepage": "https://toragonite.github.io/agent-mesh/",
+  "bugs": "https://github.com/Toragonite/agent-mesh/issues",
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "tsup"
+  },
+  "dependencies": {
+    "@toragonite/agent-mesh": "^0.1.0"
+  }
+}

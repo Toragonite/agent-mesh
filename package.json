@@ -1,0 +1,26 @@
+{
+  "name": "agent-mesh",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Drive Claude, Codex, Antigravity (Gemini), and Cursor coding agents as headless workers behind one interface. Unofficial.",
+  "license": "MIT",
+  "author": "Toragonite",
+  "workspaces": ["packages/*", "apps/*"],
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "build": "npm run build -w @toragonite/agent-mesh && npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
+    "release": "bash scripts/release-public.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitepress": "^1.6.0",
+    "vitest": "^3.0.0"
+  }
+}
