@@ -1,43 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
-### Fixes from the second adversarial review
-
-- **refusal no longer masked as success (A1):** an explicit vendor error event now
-  always resolves `status:'error'` — the partial assistant text is preserved in
-  `text` and the vendor's message is carried in `note`. Previously a partial
-  answer alongside an error event was reported as a clean `status:'ok'` with the
-  error text discarded. `AdapterExecError` stays reserved for a non-zero exit with
-  nothing parseable.
-- **exhausted-window quota (A2):** when a usage body omits `allowed`, it is now
-  derived (`false` if any window reports ≥ 100% used, else `true`) instead of
-  defaulting to `true`. An explicit `allowed` is still trusted verbatim.
-- **quota fetch deadline (A3):** new `quotaTimeoutMs` constructor option (default
-  10000) bounds the quota request via an `AbortSignal`; the request aborts at the
-  deadline and resolves `null`, so a hung endpoint can no longer stall
-  `Fleet.route()`.
-- **conversation-id value semantics (U1):** `resume()` trims the `conversationId`
-  first, then validates the trimmed value (empty and leading-`-` both rejected),
-  and passes the trimmed id to the CLI rather than the raw string with surrounding
-  whitespace.
-- **empty model is absent (U2):** a provided-but-empty (whitespace-only) `model`
-  is treated as "not requested" — no `--model`, no note, no auth-gate. A non-empty
-  `model` is trimmed before it is gated and passed.
-- **token total rule (U3):** `usage.totalTokens` uses a vendor-supplied
-  `total_tokens` verbatim; otherwise it derives from `input+output` when both are
-  present; otherwise it is omitted.
-- **malformed account is absent (U4):** a `null` or otherwise non-object `account`
-  now falls back to the default account instead of resolving ambient (or throwing).
-  An account object with no `configDir` still means ambient. Applies to `run`,
-  `resume`, `quota`, `authStatus`, and `availableModels`.
-- **extra.args reporting (U5):** dropped non-string `extra.args` entries are now
-  reported via `RunResult.note` (`extra.args contained N non-string entr(y|ies);
-  dropped`).
-- **resume working directory (U6):** `resume()` honours a string `extra.cwd` as
-  the child's working directory (`ResumeOptions` has no `cwd` field).
-- **packaging (U8):** `files` is now exactly `["dist"]`; `nodeLineStream` is
-  exported from the package entry for seam parity with the streaming adapters.
+No runtime changes in this package — the published tarball is identical to 0.1.0 apart from
+the version number. This release exists so the documentation site can build and deploy: the
+workspace root has no `"type": "module"`, so the VitePress config was loaded through the
+CommonJS path and the ESM-only VitePress build failed. Renaming the config to
+`docs/.vitepress/config.mts` fixes it. All five packages move in lockstep, so this package
+is bumped to 0.1.1 with the rest.
 
 ## 0.1.0
 
@@ -96,3 +66,40 @@ Initial release.
 - **packaging:** per-condition `types` in `exports` (correct CJS/ESM type
   resolution), `prepublishOnly` build guard, `repository`/`homepage`/`bugs`/
   `publishConfig` metadata, and an MIT `LICENSE` file.
+
+### Fixes from the second adversarial review
+
+- **refusal no longer masked as success (A1):** an explicit vendor error event now
+  always resolves `status:'error'` — the partial assistant text is preserved in
+  `text` and the vendor's message is carried in `note`. Previously a partial
+  answer alongside an error event was reported as a clean `status:'ok'` with the
+  error text discarded. `AdapterExecError` stays reserved for a non-zero exit with
+  nothing parseable.
+- **exhausted-window quota (A2):** when a usage body omits `allowed`, it is now
+  derived (`false` if any window reports ≥ 100% used, else `true`) instead of
+  defaulting to `true`. An explicit `allowed` is still trusted verbatim.
+- **quota fetch deadline (A3):** new `quotaTimeoutMs` constructor option (default
+  10000) bounds the quota request via an `AbortSignal`; the request aborts at the
+  deadline and resolves `null`, so a hung endpoint can no longer stall
+  `Fleet.route()`.
+- **conversation-id value semantics (U1):** `resume()` trims the `conversationId`
+  first, then validates the trimmed value (empty and leading-`-` both rejected),
+  and passes the trimmed id to the CLI rather than the raw string with surrounding
+  whitespace.
+- **empty model is absent (U2):** a provided-but-empty (whitespace-only) `model`
+  is treated as "not requested" — no `--model`, no note, no auth-gate. A non-empty
+  `model` is trimmed before it is gated and passed.
+- **token total rule (U3):** `usage.totalTokens` uses a vendor-supplied
+  `total_tokens` verbatim; otherwise it derives from `input+output` when both are
+  present; otherwise it is omitted.
+- **malformed account is absent (U4):** a `null` or otherwise non-object `account`
+  now falls back to the default account instead of resolving ambient (or throwing).
+  An account object with no `configDir` still means ambient. Applies to `run`,
+  `resume`, `quota`, `authStatus`, and `availableModels`.
+- **extra.args reporting (U5):** dropped non-string `extra.args` entries are now
+  reported via `RunResult.note` (`extra.args contained N non-string entr(y|ies);
+  dropped`).
+- **resume working directory (U6):** `resume()` honours a string `extra.cwd` as
+  the child's working directory (`ResumeOptions` has no `cwd` field).
+- **packaging (U8):** `files` is now exactly `["dist"]`; `nodeLineStream` is
+  exported from the package entry for seam parity with the streaming adapters.

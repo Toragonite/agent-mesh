@@ -1,3 +1,8 @@
+// This config is `.mts`, not `.ts`, on purpose: the workspace root package.json
+// has no `"type": "module"`, so it is CommonJS-by-default, but VitePress ships as
+// ESM-only. A `.ts` config would be loaded through the CommonJS `require` path and
+// fail with "vitepress resolved to an ESM file". The `.mts` extension forces the
+// ESM loader for this file regardless of the root type field. Do not rename back.
 import { defineConfig } from 'vitepress'
 
 // Public product docs, deployed to GitHub Pages from the PUBLIC repo (once per

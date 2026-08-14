@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
+
+No runtime changes in this package — the published tarball is identical to 0.1.0 apart from
+the version number. This release exists so the documentation site can build and deploy: the
+workspace root has no `"type": "module"`, so the VitePress config was loaded through the
+CommonJS path and the ESM-only VitePress build failed. Renaming the config to
+`docs/.vitepress/config.mts` fixes it. All five packages move in lockstep, so this package
+is bumped to 0.1.1 with the rest.
+
+## 0.1.0
+
+Initial release. The Google Antigravity adapter for agent-mesh, driving the official `agy` CLI
+behind the frozen `Adapter` contract:
+
+- `run()` — one-shot `agy --output-format json -p`, with tolerant last-JSON-object parsing.
+- `resume()` — continue a conversation by id via `agy --conversation <id>`.
+- `stream()` — incremental `RunEvent`s over `agy --output-format stream-json`.
+- `authStatus()` — login check through the only probe Antigravity exposes, `agy models`.
+- `availableModels()` — a fast, static 11-model catalog (no subprocess on the routing path).
+- `fetchLiveModels()` — the authoritative-but-slow live model probe; `[]` on any failure.
+- `quota()` — `null` by design (Antigravity exposes no verified usage endpoint).
+- Single trailing-newline normalization for cross-vendor comparability; `allowedTools` ignored
+  with a note; `account.configDir` passed as `AGY_HOME` (isolation unverified).
 
 Fixes from an adversarial review. Several change caller-visible behaviour:
 
@@ -25,18 +47,3 @@ Fixes from an adversarial review. Several change caller-visible behaviour:
   entr(y|ies); dropped` note instead of being filtered silently.
 - `resume()` honours a string `opts.extra.cwd` as the child's working directory.
 - `package.json` `files` is now exactly `["dist"]`.
-
-## 0.1.0
-
-Initial release. The Google Antigravity adapter for agent-mesh, driving the official `agy` CLI
-behind the frozen `Adapter` contract:
-
-- `run()` — one-shot `agy --output-format json -p`, with tolerant last-JSON-object parsing.
-- `resume()` — continue a conversation by id via `agy --conversation <id>`.
-- `stream()` — incremental `RunEvent`s over `agy --output-format stream-json`.
-- `authStatus()` — login check through the only probe Antigravity exposes, `agy models`.
-- `availableModels()` — a fast, static 11-model catalog (no subprocess on the routing path).
-- `fetchLiveModels()` — the authoritative-but-slow live model probe; `[]` on any failure.
-- `quota()` — `null` by design (Antigravity exposes no verified usage endpoint).
-- Single trailing-newline normalization for cross-vendor comparability; `allowedTools` ignored
-  with a note; `account.configDir` passed as `AGY_HOME` (isolation unverified).

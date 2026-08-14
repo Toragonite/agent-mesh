@@ -1,6 +1,6 @@
 {
   "name": "@toragonite/agent-mesh-codex",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex (OpenAI) adapter for agent-mesh — drive the official codex CLI headlessly: run, resume, quota, auth-gated models. Unofficial.",
   "keywords": ["ai","agent","orchestration","codex","openai","gpt","llm","cli","agent-mesh"],
   "license": "MIT",

@@ -1,6 +1,6 @@
 {
   "name": "@toragonite/agent-mesh-claude",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code adapter for agent-mesh — drive the official `claude` CLI as a headless worker (run / resume / stream / quota / auth), plus the absorbed claude-mesh background-agent, gateway, and bridge layers. Unofficial.",
   "keywords": ["ai","agent","orchestration","claude","claude-code","anthropic","adapter","background-agents","mesh","cli"],
   "license": "MIT",

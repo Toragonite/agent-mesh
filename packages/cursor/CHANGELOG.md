@@ -1,6 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
+
+No runtime changes in this package — the published tarball is identical to 0.1.0 apart from
+the version number. This release exists so the documentation site can build and deploy: the
+workspace root has no `"type": "module"`, so the VitePress config was loaded through the
+CommonJS path and the ESM-only VitePress build failed. Renaming the config to
+`docs/.vitepress/config.mts` fixes it. All five packages move in lockstep, so this package
+is bumped to 0.1.1 with the rest.
+
+## 0.1.0
+
+Initial release.
+
+- `CursorAdapter` implementing the agent-mesh `Adapter` contract against the
+  official `cursor-agent` CLI.
+- `run()` / `resume()` via `cursor-agent -p --output-format json`, with a
+  tolerant last-JSON-object parser and a single result mapper (conversation id,
+  final text, camelCase token usage with a derived total, status semantics).
+- `stream()` via `-p --output-format stream-json --stream-partial-output`,
+  suppressing the CLI's final full-answer repeat (belt-and-braces: no
+  `timestamp_ms`, or text equal to the accumulated answer) so incremental deltas
+  never double the answer.
+- `availableModels()` read LIVE from `cursor-agent models` and memoized, with a
+  provisional latency heuristic, native-vs-resold classification (resold entries
+  carry a quota warning), and a four-entry curated fallback so it never throws.
+- `authStatus()` shelling out to `cursor-agent status` (identifier surfaced as
+  detail, never a token).
+- `quota()` returns `null` by design — Cursor exposes no verified usage endpoint.
+- `createChat()` helper to pre-allocate a conversation id via
+  `cursor-agent create-chat`.
+- `trust` option (default `true`, emits `--trust`); `--force`/`--yolo` is never
+  passed. A trust refusal is detected and surfaced with remediation.
+- Injectable `exec` / `lineStream` / `env` / `models` seams; fully hermetic test
+  suite (no real CLI, network, or home directory).
 
 Fixes from an adversarial review (cursor-specific defects and cross-adapter
 uniform rules):
@@ -44,29 +77,3 @@ uniform rules):
   the README warns that `extra.args` must not end with a value-expecting flag.
 - **`resume()` honours a working directory** via `opts.extra.cwd` (U6).
 - **`package.json` `files`** is now exactly `["dist"]` (U8).
-
-## 0.1.0
-
-Initial release.
-
-- `CursorAdapter` implementing the agent-mesh `Adapter` contract against the
-  official `cursor-agent` CLI.
-- `run()` / `resume()` via `cursor-agent -p --output-format json`, with a
-  tolerant last-JSON-object parser and a single result mapper (conversation id,
-  final text, camelCase token usage with a derived total, status semantics).
-- `stream()` via `-p --output-format stream-json --stream-partial-output`,
-  suppressing the CLI's final full-answer repeat (belt-and-braces: no
-  `timestamp_ms`, or text equal to the accumulated answer) so incremental deltas
-  never double the answer.
-- `availableModels()` read LIVE from `cursor-agent models` and memoized, with a
-  provisional latency heuristic, native-vs-resold classification (resold entries
-  carry a quota warning), and a four-entry curated fallback so it never throws.
-- `authStatus()` shelling out to `cursor-agent status` (identifier surfaced as
-  detail, never a token).
-- `quota()` returns `null` by design — Cursor exposes no verified usage endpoint.
-- `createChat()` helper to pre-allocate a conversation id via
-  `cursor-agent create-chat`.
-- `trust` option (default `true`, emits `--trust`); `--force`/`--yolo` is never
-  passed. A trust refusal is detected and surfaced with remediation.
-- Injectable `exec` / `lineStream` / `env` / `models` seams; fully hermetic test
-  suite (no real CLI, network, or home directory).

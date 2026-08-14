@@ -3,6 +3,15 @@
 All notable changes to **@toragonite/agent-mesh-claude** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1]
+
+No runtime changes in this package — the published tarball is identical to 0.1.0 apart from
+the version number. This release exists so the documentation site can build and deploy: the
+workspace root has no `"type": "module"`, so the VitePress config was loaded through the
+CommonJS path and the ESM-only VitePress build failed. Renaming the config to
+`docs/.vitepress/config.mts` fixes it. All five packages move in lockstep, so this package
+is bumped to 0.1.1 with the rest.
+
 ## [0.1.0]
 
 Absorbed **claude-mesh** and added the agent-mesh `Adapter` implementation.
