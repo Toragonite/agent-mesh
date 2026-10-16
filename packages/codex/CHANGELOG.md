@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.2
+
+`quota()` reads the live usage body again. It had returned `null` for every account.
+
+- **Nested `rate_limit` shape:** the `wham/usage` body nests the rate-limit fields
+  under `rate_limit` — `rate_limit.primary_window` / `rate_limit.secondary_window`,
+  each with `used_percent`, `limit_window_seconds`, `reset_after_seconds`, and
+  `reset_at` (epoch seconds), beside `rate_limit.allowed` / `rate_limit.limit_reached`
+  and a top-level `plan_type` / `credits`. The adapter looked for the windows at the
+  top level only, so it never recognized a reading. They are now read from
+  `rate_limit`; the older top-level shape is still read as a fallback when the body
+  carries no recognized `rate_limit`. Windows keep the labels `primary` / `secondary`,
+  and `raw` keeps the whole body.
+- **`resetAt`:** from `reset_at` (epoch seconds, or milliseconds when ≥ 1e12), else
+  the capture time plus `reset_after_seconds` when that is a finite non-negative
+  number, else absent. An epoch of 0 or below is an unset field, no longer a 1970 reset.
+- **`allowed`:** `rate_limit.allowed` when it is a boolean, else the inverse of
+  `rate_limit.limit_reached` when that is, else derived (no window at 100%).
+- **Body read bounded:** the response body is now raced against the same
+  `quotaTimeoutMs` deadline as the request, so a response whose body never ends
+  resolves `null` in time instead of stalling `Fleet.route()`.
+
+`availableModels()` now lists the models the CLI itself offers the account.
+
+- **Live listing:** one `codex app-server` session with the account's `CODEX_HOME`
+  (`initialize` → `initialized` → `model/list`, following `nextCursor` for at most 10
+  pages), ended by closing the app-server's stdin; it counts only when the app-server
+  then exits by itself. Each entry becomes a `ModelInfo` with `id`, `label` (the
+  display name, when it differs), `default` (`isDefault`), and the new `efforts`
+  (`supportedReasoningEfforts[].reasoningEffort`). The child env drops every
+  `ANTHROPIC_*` / `CLAUDE_*` / `CLAUDECODE` variable.
+- **Never a throw, never a hang:** a spawn error, a JSON-RPC error, a malformed line,
+  an early or non-zero exit, or the new `modelsTimeoutMs` deadline (default 15s — the
+  app-server's process group is killed at it) falls back to the static catalog. A
+  successful listing is memoized per `CODEX_HOME`; a failed one is retried after the
+  new `modelsCacheMs` (default 60s), so routing never spawns per call.
+- **`fetchLiveModels()`** (new export, like the Antigravity adapter's): the same
+  listing on its own, `[]` on any failure. `STATIC_MODELS` is exported too.
+- **Static catalog updated** to what `codex app-server` listed on 2026-10-14:
+  `gpt-6.1-sol` (now marked the default), `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
+  `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, plus the unchanged API-key-only
+  `gpt-5.1-codex-max` and `gpt-5.2`. `gpt-5.5` is no longer listed; naming it still
+  runs, with the usual "not in known catalog" note. Auth-mode gating is unchanged.
+
+All five packages move in lockstep, so the others are bumped to 0.1.2 with this one.
+
 ## 0.1.1
 
 No runtime changes in this package — the published tarball is identical to 0.1.0 apart from

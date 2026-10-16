@@ -3,6 +3,13 @@
 All notable changes to **@toragonite/agent-mesh-claude** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2]
+
+No changes in this package — the published tarball is identical to 0.1.1 apart from the
+version number. This release carries the Codex and Cursor quota fixes
+(`@toragonite/agent-mesh-codex`, `@toragonite/agent-mesh-cursor`). All five packages move
+in lockstep, so this package is bumped to 0.1.2 with the rest.
+
 ## [0.1.1]
 
 No runtime changes in this package — the published tarball is identical to 0.1.0 apart from

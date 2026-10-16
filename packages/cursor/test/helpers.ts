@@ -5,6 +5,74 @@ import type {
   LineStreamFn,
   StreamEndMeta,
 } from '../src/exec.js';
+import type { ReadTextFile } from '../src/quota.js';
+
+/** A file reader that records every path it is handed and returns a fixed body (or null). */
+export function recordingReader(content: string | null): { read: ReadTextFile; paths: string[] } {
+  const paths: string[] = [];
+  const read: ReadTextFile = async (path) => {
+    paths.push(path);
+    return content;
+  };
+  return { read, paths };
+}
+
+/**
+ * A file reader over an in-memory "disk": returns the content stored for a path, null
+ * for any other path, and records every path it is handed, in order.
+ */
+export function mapReader(files: Record<string, string>): { read: ReadTextFile; paths: string[] } {
+  const paths: string[] = [];
+  const read: ReadTextFile = async (path) => {
+    paths.push(path);
+    return Object.prototype.hasOwnProperty.call(files, path) ? (files[path] ?? null) : null;
+  };
+  return { read, paths };
+}
+
+/** One recorded fetch call: the URL and the RequestInit exactly as handed to the seam. */
+export interface FetchCall {
+  url: unknown;
+  init: RequestInit | undefined;
+}
+
+/**
+ * A fetch fake that records calls and answers with a chosen ok/status and a `json()`
+ * implementation (a fixed body by default). Never touches the network.
+ */
+export function fakeFetch(
+  body: unknown,
+  opts: { ok?: boolean; status?: number; json?: () => Promise<unknown> } = {},
+): { fn: typeof fetch; calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const ok = opts.ok ?? true;
+  const status = opts.status ?? (ok ? 200 : 401);
+  const json = opts.json ?? (async () => body);
+  const fn = (async (url: unknown, init?: RequestInit) => {
+    calls.push({ url, init });
+    return { ok, status, json } as unknown as Response;
+  }) as unknown as typeof fetch;
+  return { fn, calls };
+}
+
+/** A fetch fake that records calls and runs `impl` (e.g. throw, or never settle). */
+export function scriptedFetch(impl: (init: RequestInit | undefined) => Promise<Response>): {
+  fn: typeof fetch;
+  calls: FetchCall[];
+} {
+  const calls: FetchCall[] = [];
+  const fn = (async (url: unknown, init?: RequestInit) => {
+    calls.push({ url, init });
+    return impl(init);
+  }) as unknown as typeof fetch;
+  return { fn, calls };
+}
+
+/** An unsigned JWT-shaped token carrying `claims` — enough for an `exp` read, never valid. */
+export function jwt(claims: Record<string, unknown>): string {
+  const part = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${part({ alg: 'HS256', typ: 'JWT' })}.${part(claims)}.not-a-signature`;
+}
 
 /** A fake ExecFn that records requests and returns a preset result. */
 export function recordingExec(result: Partial<ExecResult> = {}): {

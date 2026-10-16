@@ -79,6 +79,12 @@ export interface ModelInfo {
   authModes?: string[];
   /** True for the adapter's default pick when a task names no model. */
   default?: boolean;
+  /**
+   * Reasoning-effort levels the vendor's own model list says this model accepts
+   * (e.g. 'low', 'medium', 'high'), in the vendor's order. Omit = not reported —
+   * NOT "none accepted". Additive: adapters that never report it are unaffected.
+   */
+  efforts?: string[];
 }
 
 export interface QuotaWindow {

@@ -32,7 +32,12 @@ Node ≥ 18.17과, `PATH`상에서 로그인된 `cursor-agent`가 필요합니�
 | `lineStream` | `LineStreamFn` | `nodeLineStream` | `stream()`을 뒷받침하는 스트리밍 프로세스 seam. |
 | `binary` | `string` | `'cursor-agent'` | cursor-agent 실행 파일 경로 또는 명령 이름. |
 | `defaultAccount` | `Account` | — | 호출이 계정을 넘기지 않을 때 사용할 계정. |
-| `env` | `Record<string, string \| undefined>` | `process.env` | 환경 변수 seam — 모든 자식 프로세스 환경의 기반. |
+| `env` | `Record<string, string \| undefined>` | `process.env` | 환경 변수 seam — 모든 자식 프로세스 환경의 기반이며, `quota()`가 로그인 파일 위치를 여기서 결정합니다. |
+| `readTextFile` | `(path) => Promise<string \| null>` | fs 읽기 | `quota()`가 로그인 파일을 읽을 때 쓰는 파일 읽기 seam. |
+| `readKeychain` | `() => Promise<KeychainReadResult>` | `/usr/bin/security` | `quota()`의 macOS 키체인 읽기 seam. 테스트에서 주입해 실제 `security`를 실행하지 않게 합니다. |
+| `platform` | `NodeJS.Platform` | `process.platform` | 로그인 파일 위치와 키체인 읽기 여부를 결정. 테스트에서 macOS·비 macOS 경로를 구동하도록 설정. |
+| `fetchFn` | `typeof fetch` | 전역 `fetch` | 쿼터 엔드포인트용 fetch seam. |
+| `quotaTimeoutMs` | `number` | `10000` | 쿼터 조회의 최대 대기 시간. 이 시점에 요청을 중단합니다. |
 | `trust` | `boolean` | `true` | `--trust`를 전달할지 여부. [trust 옵션](#trust-옵션) 참고. |
 | `models` | `ModelInfo[]` | — | 라이브 `cursor-agent models` 조회를 건너뜁니다(오프라인 사용, hermetic 테스트, 또는 고정 카탈로그). |
 | `authTimeoutMs` | `number` | `20000` | `authStatus()` CLI 프로브의 최대 대기 시간. |
@@ -188,13 +193,72 @@ detail: 'someone@example.com' }`을 반환합니다. 0이 아닌 종료 코드, 
 
 ## 쿼터
 
-`quota()`는 무조건 `null`을 반환하며, `capabilities.quota`는 `false`입니다.
-Cursor는 검증된 사용량 엔드포인트를 노출하지 않습니다. `{ allowed: true,
-windows: [] }`를 임의로 만들어 반환하면 Fleet의 라우터에게 소진된 계정이
-여유가 가득 있다고 알리는 셈이 됩니다. `null`은 정직한 "헤드룸 알 수 없음"
-신호입니다 — Fleet은 이를 "제외되지 않음"으로 취급하므로 Cursor 어댑터는
-여전히 라우팅 대상이 되지만, 실제 사용량을 보고하는 벤더와 쿼터 기준으로
-비교되지는 않습니다.
+`quota()`는 **본인 런타임에서만** 동작하며, 본인의 `cursor-agent` 로그인으로
+인증됩니다 — 서버를 거쳐 프록시되지 않습니다. `capabilities.quota`는 `true`입니다.
+CLI가 토큰을 보관하는 곳에서 액세스 토큰을 읽어 Cursor 대시보드 엔드포인트
+`GetCurrentPeriodUsage`를 호출합니다.
+
+**macOS**에서는 CLI의 기본 자격 증명 저장소가 로그인 **키체인**이므로, 어댑터가
+토큰을 **먼저** 거기서 읽습니다 — CLI와 똑같이 `/usr/bin/security find-generic-password
+-a cursor-user -s cursor-access-token -w`를 스폰합니다(셸 없음, 최소
+`PATH`/`HOME`/`USER`/`LANG` 환경, 10초 타임아웃). 키체인 항목 **`cursor-access-token`**
+(계정 **`cursor-user`**)을 가져와 **오직** 그 한 번의 사용량 요청의 `Authorization`
+헤더로만 씁니다. macOS가 접근 프롬프트를 차단하거나 사용자가 거부하면(`security`가
+51/36로 종료하거나 상호작용이 허용되지 않음 / 취소 메시지), 어댑터는 거부된 프롬프트가
+매 조회마다 다시 뜨지 않도록 **6시간** 동안(메모리상, 인스턴스별) 키체인 읽기를
+멈추고, 그동안 파일로 대체합니다. `AGENT_CLI_CREDENTIAL_STORE=file` 또는 `=memory`이면
+키체인을 건너뜁니다.
+
+**로그인 파일**은 그다음에 읽습니다(그리고 macOS 밖에서는 유일한 출처입니다). 아래 중
+처음으로 존재하는 것이 로그인입니다:
+
+| 플랫폼 | 1. CLI의 파일 저장소 | 2. 이전 위치 |
+|---|---|---|
+| macOS | `~/.cursor/auth.json` | `$XDG_CONFIG_HOME/cursor-agent/auth.json`(없으면 `~/.config/…`) |
+| Linux 및 기타 Unix | `$XDG_CONFIG_HOME/cursor/auth.json`(없으면 `~/.config/…`) | `$XDG_CONFIG_HOME/cursor-agent/auth.json`(없으면 `~/.config/…`) |
+| Windows | `%APPDATA%\Cursor\auth.json` | `%APPDATA%\Cursor-agent\auth.json` |
+
+첫 번째 파일이 존재하면 그것이 기준입니다 — 쓸 수 있는 토큰이 없어도 이전 위치는
+보지 않습니다. `AGENT_CLI_CREDENTIAL_STORE=memory`이면 CLI가 파일을 남기지 않으므로
+아무것도 읽지 않고 `null`을 반환합니다. 요청은 `quotaTimeoutMs`(기본 10초)로
+제한되며 그 시점에 중단됩니다. 토큰이 만료된 JWT이면 요청 없이 `null`을 반환합니다
+— 토큰 갱신은 CLI가 실행될 때 스스로 하며, 이 어댑터는 토큰을 갱신하지 않습니다.
+
+```ts
+const snapshot = await new CursorAdapter().quota()
+// { vendor: 'cursor', allowed: true, windows: [
+//     { label: 'total', usedPercent: 1.045,  resetAt: '2026-08-23T00:07:46.000Z' },
+//     { label: 'auto',  usedPercent: 0.4525, resetAt: '2026-08-23T00:07:46.000Z' },
+//     { label: 'api',   usedPercent: 5.35,   resetAt: '2026-08-23T00:07:46.000Z' } ], raw: … }
+```
+
+- **윈도우**는 Cursor 대시보드의 세 막대 — `total`, `auto`(자사 모델), `api` —
+  입니다(`planUsage.totalPercentUsed` / `autoPercentUsed` / `apiPercentUsed`). 값은
+  이미 0..100 단위의 백분율이며 그대로(범위만 잘라서) 보고합니다 — 분모는 Cursor
+  내부 기준이므로 `지출 / 한도`가 아닙니다. 응답에 없는 백분율은 0으로 만들지 않고
+  빼 둡니다.
+- **`resetAt`**은 모든 윈도우에서 결제 주기의 끝(`billingCycleEnd`)입니다.
+- **`allowed`**는 파생값입니다: 어느 윈도우든 100%에 이르면 `false`.
+- **`raw`**는 응답 본문 전체입니다(지출 수치는 센트 단위).
+
+어떤 실패든 — 자격 증명 없음, 읽을 수 없거나 깨진 데이터, 토큰 없음, 만료된 토큰,
+네트워크 오류, 2xx가 아닌 응답, 타임아웃, 다른 형태의 본문 — 예외 대신 `null`을
+반환하며, 토큰은 로그·반환값·스냅샷 어디에도 들어가지 않고 오직 요청 헤더에만
+닿습니다. `null`은 정직한 "헤드룸 알 수 없음" 신호입니다 — Fleet은 이를 "제외되지
+않음"으로 취급하므로 Cursor 어댑터는 여전히 라우팅 대상이 됩니다.
+
+`account.configDir`은 참고하지 않습니다(`cursor-agent`에는 config-dir 격리가
+없음). 따라서 `quota()`는 항상 `run()`과 같은 로그인을 읽습니다.
+`QuotaSnapshot.capturedAt`은 이 어댑터가 찍지 않습니다. `readKeychain`,
+`readTextFile`, `fetchFn`, `platform`은 주입 가능하므로 실제 `security`·홈
+디렉터리·네트워크 없이 전체 읽기를 테스트할 수 있습니다.
+
+::: info 키체인 읽기, 정확히
+macOS에서 어댑터는 `cursor-agent` CLI 자신의 키체인 항목 — `cursor-access-token`,
+계정 `cursor-user` — 을 `/usr/bin/security`로 읽으며, 오직 그 계정 본인의 사용량을
+Cursor에 조회하기 위해서만 사용합니다. 키체인에 쓰지 않으며, 토큰은 그 한 번의 요청
+`Authorization` 헤더 외에는 아무 데도 가지 않습니다.
+:::
 
 ## 참고사항
 

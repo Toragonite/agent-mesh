@@ -79,8 +79,10 @@ const STDERR_TAIL_CAP = 4_096;
  * spawned `detached:true` (POSIX process group; macOS/Linux only), `-child.pid`
  * addresses the whole group, reaping the grandchildren too. Falls back to a direct
  * `child.kill` when the group send fails (pid gone) or the pid is unknown.
+ *
+ * Exported for the package's own app-server session (not re-exported from the entry).
  */
-function killProcessGroup(
+export function killProcessGroup(
   child: { pid?: number; kill(signal: NodeJS.Signals): boolean },
   signal: NodeJS.Signals,
 ): void {
@@ -105,9 +107,10 @@ function killProcessGroup(
  * (`{...this.env, CLAUDE_CONFIG_DIR}`) and passes it here, so a hermetic caller (e.g. `env: {}`)
  * stays isolated from the ambient environment and introspection cannot resolve a different account
  * than execution. Keys with an `undefined` value are dropped. When `env` is omitted, the child
- * inherits the parent process env (spawn's default).
+ * inherits the parent process env (spawn's default). Exported for the package's own
+ * app-server session (not re-exported from the entry).
  */
-function buildEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv | undefined {
+export function buildEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv | undefined {
   if (!env) return undefined;
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(env)) {

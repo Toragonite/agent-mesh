@@ -31,6 +31,9 @@ and is overridable for testing:
 | `readTextFile` | `ReadTextFile` | fs read | File-read seam used by `authStatus()` and `quota()`. |
 | `fetchFn` | `typeof fetch` | global `fetch` | Fetch seam for the quota endpoint. |
 | `env` | `NodeJS.ProcessEnv` | `process.env` | Environment seam. |
+| `quotaTimeoutMs` | `number` | `10000` | Deadline for the quota fetch. |
+| `modelsTimeoutMs` | `number` | `15000` | Deadline for the `codex app-server` model listing; its process group is killed at it. |
+| `modelsCacheMs` | `number` | `60000` | How long a failed listing returns the static catalog before the CLI is asked again. |
 
 ## Run and resume
 
@@ -68,22 +71,57 @@ but token-less file (e.g. after a logout) resolves `loggedIn: false` rather than
 false-positive login. `mode: 'api-key'` comes from an `OPENAI_API_KEY` environment
 variable, or from that same key embedded inside `auth.json`.
 
-Under a ChatGPT login only the universal models are selectable; `gpt-5.1-codex-max`
-and `gpt-5.2` require an API key. When logged out, the full annotated catalog is
-returned so callers can still introspect what each login would unlock. No model is
-marked `default` — when a task names no model, the adapter omits `--model` and the
-CLI applies its own default.
+### The CLI's own list
+
+`availableModels(account)` asks the CLI. It opens one `codex app-server` session
+with that account's `CODEX_HOME` — JSON-RPC lines on stdio: `initialize` →
+`initialized` → `model/list`, following `nextCursor` for at most 10 pages — and
+maps each entry to a `ModelInfo`: `id`, `label` (the display name, when it
+differs), `default` (the CLI's `isDefault`), and `efforts` (its
+`supportedReasoningEfforts`). It then ends the session by closing the app-server's
+stdin; the listing counts only when the app-server exits by itself. If it does not
+answer, or does not exit, within `modelsTimeoutMs` (default 15s), its process group
+is killed. The child env is the adapter's env minus every `ANTHROPIC_*` /
+`CLAUDE_*` / `CLAUDECODE` variable. A successful listing is memoized per
+`CODEX_HOME`; a failed one is retried after `modelsCacheMs`.
+
+On any failure — `codex` not installed, a JSON-RPC error, a malformed line, an
+early or non-zero exit, the deadline — the static catalog below is returned
+instead. `availableModels()` never throws and never hangs. `fetchLiveModels()` is
+the same listing on its own, returning `[]` on any failure, so a caller can tell a
+live answer from the fallback:
+
+```ts
+import { fetchLiveModels } from '@toragonite/agent-mesh-codex'
+const live = await fetchLiveModels({ codexHome: '/path/to/codex-home' }) // [] on any failure
+```
+
+Both lists are gated the same way. Under a ChatGPT login only the universal models
+are selectable; `gpt-5.1-codex-max` and `gpt-5.2` require an API key. When logged
+out, the full annotated list is returned so callers can still introspect what each
+login would unlock. When a task names no model, the adapter omits `--model` and the
+CLI applies its own default. The pre-spawn check in `run()`/`resume()` uses the
+static catalog and never starts the app-server.
+
+### The static catalog
+
+`STATIC_MODELS` — what `codex app-server` listed on 2026-10-14, plus the
+API-key-only variants:
 
 | Model | Latency¹ | Available under |
 |---|---|---|
+| `gpt-6.1-sol` | fast | ChatGPT login, API key (the default) |
+| `gpt-6-astra` | fast | ChatGPT login, API key |
+| `gpt-6-sol` | fast | ChatGPT login, API key |
+| `gpt-6-luna` | fast | ChatGPT login, API key |
 | `gpt-5.6-sol` | fast | ChatGPT login, API key |
 | `gpt-5.6-terra` | fast | ChatGPT login, API key |
 | `gpt-5.6-luna` | fast | ChatGPT login, API key |
-| `gpt-5.5` | fast | ChatGPT login, API key |
 | `gpt-5.1-codex-max` | slow | API key only |
 | `gpt-5.2` | slow | API key only |
 
-¹ Latency class is a provisional (unverified) estimate, not a measured value.
+¹ Latency class is a provisional (unverified) estimate, not a measured value. A live
+entry the catalog does not know is classed `fast`.
 
 ## Quota
 

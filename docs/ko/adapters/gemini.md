@@ -34,6 +34,8 @@ npm install @toragonite/agent-mesh @toragonite/agent-mesh-gemini
 | `defaultAccount` | `Account` | — | 호출이 계정을 넘기지 않을 때 사용할 계정. `configDir`이 `AGY_HOME`을 설정합니다(`agy`에는 문서화되지 않은 변수 — [동작 참고사항](#동작-참고사항) 참고). |
 | `env` | `Record<string, string \| undefined>` | `process.env` | 환경 변수 seam — 모든 자식 프로세스 환경과 모든 환경 읽기의 기반. |
 | `authTimeoutMs` | `number` | `20000` | `agy models` 인증 프로브의 최대 대기 시간. |
+| `quotaTimeoutMs` | `number` | `90000` | `quota()`가 사용하는 `agy -p /usage` 읽기의 최대 대기 시간. |
+| `quotaCacheMs` | `number` | `60000` | `quota()` 결과(스냅샷 또는 `null`)를 계정별로 재사용하는 시간. `0`이면 캐시를 끕니다. |
 
 ## 실행과 재개
 
@@ -153,14 +155,55 @@ true, mode: 'google' }`를 반환합니다. 그 외(0이 아닌 종료 코드, �
 
 ## 쿼터
 
-`quota()`는 무조건 `null`을 반환하며, `capabilities.quota`는 `false`입니다.
-Antigravity는 검증된 사용량 엔드포인트를 노출하지 않습니다. 이는 그냥 채워 넣은
-스텁이 아니라 의도적인 "헤드룸 알 수 없음" 신호입니다: `{ allowed: true,
-windows: [] }`를 임의로 만들어 반환하면 Fleet의 라우터에게 소진된 계정이 여유가
-가득 있다고 알리는 셈이 됩니다. 대신 `null`을 반환함으로써 라우터는 Gemini의
-헤드룸을 가짜 만탱크로 믿는 대신 **확인되지 않음**으로 취급합니다 — 어댑터를
-후보에서 제외하지는 않지만, 실제 사용량을 보고하는 벤더와 쿼터 기준으로
-비교하지는 않습니다. 절대 예외를 던지지 않습니다.
+`quota()`는 `agy`에게 직접 묻습니다. `agy -p /usage --output-format json`을
+실행하는데, `agy`(1.1.11 이상)는 이를 프린트 모드에서 **에이전트 턴 없이,
+쿼터를 소모하지 않고** 답합니다 — 수치는 `agy`가 자체 로그인으로 가져오므로 이
+어댑터는 토큰을 읽거나 보관하거나 갱신하지 않습니다. `capabilities.quota`는
+`true`입니다.
+
+```ts
+const snap = await new GeminiAdapter().quota()
+// { vendor: 'gemini', allowed: true, windows: [
+//     { label: 'gemini-weekly', usedPercent: 0, resetAt: '2026-10-20T07:57:54.000Z' },
+//     { label: 'gemini-5h',     usedPercent: 0, resetAt: '2026-10-15T15:10:03.000Z' },
+//     { label: '3p-weekly',     usedPercent: 0, resetAt: '2026-10-22T10:10:03.000Z' },
+//     { label: '3p-5h',         usedPercent: 0, resetAt: '2026-10-15T15:10:03.000Z' } ],
+//   raw: { groups: [...] } }
+```
+
+- **윈도우.** 활성화된 버킷마다 하나씩이며, 그룹 순서대로 그다음 버킷 순서대로
+  나열됩니다. agy 1.3.5에서 "Gemini Models" 그룹에는 `gemini-weekly`와
+  `gemini-5h`가, "Claude and GPT models" 그룹(리셀 모델)에는 `3p-weekly`와
+  `3p-5h`가 있습니다. `label`은 버킷 id입니다(없으면 `<그룹 이름> <윈도우>`).
+  `usedPercent`는 `(1 − remaining_fraction) × 100`을 소수점 한 자리로 반올림해
+  0..100으로 제한한 값입니다. `resetAt`은 버킷의 RFC 3339 `reset_time`을 ISO
+  시각으로 바꾼 값입니다.
+- **제외되며, 0으로 보고되지 않는 경우.** 비활성화된 버킷, `remaining_amount`만
+  있는 버킷(나눌 한도가 없음)이나 두 필드 모두 없는 버킷(분수 없이 amount가 0이면
+  소진이 아니라 알 수 없음), 그리고 1을 넘는 `remaining_fraction`.
+- **`allowed`**는 모델 그룹별 윈도우에서 파생됩니다: 어느 윈도우든 100%이면
+  `false`입니다. 리셀 모델의 윈도우도 포함되므로 소진된 `3p-*` 윈도우는
+  어댑터 전체를 막습니다. `raw`는 `command.data` 객체입니다.
+- **어떤 실패든 `null`("헤드룸 알 수 없음")** — 로그인되지 않음, API 키 / ADC
+  세션, 0이 아닌 종료 코드, `AGY_ERROR:` 또는 `error:` 줄, `SUCCESS`가 아닌 상태,
+  다른 형태의 본문, 쓸 수 있는 버킷 없음, 1 MiB를 넘는 stdout, 또는 타임아웃.
+  Fleet은 `null`을 "헤드룸 미확인"으로 취급하고 어댑터를 계속 후보로 둡니다.
+  `{ allowed: true, windows: [] }`를 임의로 만들어 반환하는 일은 없습니다.
+  `quota()`는 예외를 던지지 않습니다.
+- **비용과 한계.** 읽을 때마다 `agy`의 language server가 기동됩니다(수 초).
+  읽기는 **90초** 뒤 타임아웃됩니다(`quotaTimeoutMs`, 프로세스 그룹 전체를 종료).
+  결과(스냅샷 또는 `null`)는 **60초** 동안 캐시됩니다(`quotaCacheMs`, `0`이면
+  캐시 끔). 어댑터 인스턴스·계정별로 읽기는 동시에 **하나**만 실행되며, 동시에
+  호출한 쪽은 그 결과를 기다립니다. 자식 프로세스는 `run()`과 같은 계정 env,
+  `/dev/null` stdin, 비공개 작업 디렉터리(`<os tmpdir>/agent-mesh-agy-usage`,
+  `0700`으로 생성되며 비공개가 아니면 거부)로 어댑터의 `exec` 시임을 통해
+  시작됩니다.
+
+::: warning 계정 격리는 제공되지 않습니다
+`agy` 1.3.5는 `AGY_HOME`을 읽지 않으므로, `quota()`가 보고하는 계정을 포함해
+모든 계정이 `agy`의 기본 로그인을 공유합니다. [동작 참고사항](#동작-참고사항)을
+참고하세요.
+:::
 
 ## 동작 참고사항
 
@@ -173,11 +216,14 @@ windows: [] }`를 임의로 만들어 반환하면 Fleet의 라우터에게 소�
 - **`allowedTools`는 무시됩니다.** `agy`에는 대응하는 플래그가 없으므로
   `task.allowedTools`는 버려지고, 결과에는 `allowedTools not supported by agy;
   ignored` 주석이 남습니다.
-- **`account.configDir` → `AGY_HOME`.** `agy`에는 문서화된 config-dir 환경
-  변수가 없습니다. `account.configDir`을 넘기면 어댑터가 이를 `AGY_HOME`으로
-  설정하고, Antigravity의 계정 격리가 이 변수로 이루어지는지는 **검증되지
-  않았다**는 주석을 추가합니다. `configDir` 없이 명시적으로 넘긴 `account`는
-  앰비언트 로그인을 의미하며 기본 계정의 디렉터리를 물려받지 않습니다.
+- **agy 1.3.5는 계정 격리를 제공하지 않으며, 모든 계정이 기본 로그인을
+  공유합니다.** `agy`에는 문서화된 config-dir 환경 변수가 없고, agy 1.3.5
+  바이너리에는 `AGY_HOME` 문자열도 없습니다. `account.configDir`을 넘기면 어댑터는
+  여전히 이를 `AGY_HOME`으로 설정하고(언젠가 이를 읽는 agy가 받을 수 있도록)
+  agy 1.3.5는 이를 읽지 않는다는 주석을 추가합니다. 하지만 모든 계정은 `agy`의
+  기본 로그인으로 실행되며 `quota()`도 그 로그인의 사용량을 보고합니다.
+  `configDir` 없이 명시적으로 넘긴 `account`는 앰비언트 로그인을 의미하며 기본
+  계정의 디렉터리를 물려받지 않습니다.
 - **지연시간.** 한 단어 답변이 **12–15초**로 관측되었습니다(Claude
   Code/Codex의 약 5초와 대비됩니다). `agy` 자체의 `--print-timeout` 기본값은
   `5m0s`입니다. `timeoutMs`를 넉넉하게 설정하세요 — 타임아웃은 `status:

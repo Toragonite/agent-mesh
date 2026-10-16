@@ -3,8 +3,8 @@
 > **Status:** the core contract is frozen. All four adapters —
 > `@toragonite/agent-mesh-claude`, `@toragonite/agent-mesh-codex`,
 > `@toragonite/agent-mesh-gemini`, and `@toragonite/agent-mesh-cursor` — are
-> published together with core at v0.1.0. See [Adapters](/adapters/) for
-> details.
+> published together with core. See [Adapters](/adapters/) for details and
+> current versions.
 
 ## Install
 

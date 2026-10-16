@@ -7,13 +7,13 @@
 
 | 어댑터 | 패키지 | 구동 CLI | 상태 |
 |---|---|---|---|
-| Claude Code | `@toragonite/agent-mesh-claude` | `claude` | ✅ v0.1.0 |
-| Codex | `@toragonite/agent-mesh-codex` | `codex` | ✅ v0.1.0 |
-| Antigravity | `@toragonite/agent-mesh-gemini` | `agy` | ✅ v0.1.0 |
-| Cursor | `@toragonite/agent-mesh-cursor` | `cursor-agent` | ✅ v0.1.0 |
+| Claude Code | [`@toragonite/agent-mesh-claude`](https://www.npmjs.com/package/@toragonite/agent-mesh-claude) | `claude` | ✅ 배포됨 |
+| Codex | [`@toragonite/agent-mesh-codex`](https://www.npmjs.com/package/@toragonite/agent-mesh-codex) | `codex` | ✅ 배포됨 |
+| Antigravity | [`@toragonite/agent-mesh-gemini`](https://www.npmjs.com/package/@toragonite/agent-mesh-gemini) | `agy` | ✅ 배포됨 |
+| Cursor | [`@toragonite/agent-mesh-cursor`](https://www.npmjs.com/package/@toragonite/agent-mesh-cursor) | `cursor-agent` | ✅ 배포됨 |
 
 네 어댑터 모두 구현이 끝났고 각자 벤더의 CLI를 대상으로 검증되었으며, 코어와
-함께 v0.1.0으로 모두 배포됩니다. Antigravity와 Cursor는 넷 중 가장 최근에
+함께 같은 릴리스로 모두 배포됩니다. Antigravity와 Cursor는 넷 중 가장 최근에
 추가된 어댑터라, 모델별 지연 시간 등급은 아직 잠정치입니다.
 
 ## Capabilities
@@ -25,12 +25,13 @@
 |---|---|---|---|---|---|
 | Claude Code | ✅ | `mid-run` | ✅ | ✅ | ✅ |
 | Codex | ✅ | `turn` | — | ✅ | — |
-| Antigravity | ✅ | `turn` | — | — | ✅ |
-| Cursor | ✅ | `turn` | — | — | ✅ |
+| Antigravity | ✅ | `turn` | — | ✅ | ✅ |
+| Cursor | ✅ | `turn` | — | ✅ | ✅ |
 
-Antigravity와 Cursor는 둘 다 `quota: false`입니다 — 두 벤더 모두 검증된 사용량
-엔드포인트를 노출하지 않으므로, `quota()`는 스냅샷을 임의로 만들어내는 대신
-의도적으로 `null`을 반환합니다(각 어댑터 페이지의 쿼터 절 참고).
+Antigravity는 `quota: true`입니다 — `quota()`는 `agy -p /usage`를 실행하며, CLI가
+자체 로그인으로 에이전트 턴 없이 답한 결과로 네 개의 사용량 윈도우
+(`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`)를 반환하고, 어떤 실패든
+`null`을 반환합니다(어댑터 페이지의 쿼터 절 참고).
 
 ## Claude Code
 
@@ -48,7 +49,7 @@ OpenAI의 CLI. `resume()`을 통한 턴 단위 조종. 모델 선택은 인증 �
 
 Google의 소비자용 코딩 에이전트(`agy`)입니다. 정적 모델 카탈로그(세 항목은
 다른 벤더의 모델을 리셀), `stream()` 지원, 대화 id 재개를 통한 수정을
-제공합니다. `quota()`는 의도적으로 `null`을 반환합니다. 자세한 내용은
+제공합니다. `quota()`는 `agy -p /usage`로 계정의 플랜 사용량을 읽습니다. 자세한 내용은
 [Antigravity 어댑터 페이지](/ko/adapters/gemini)를 참고하세요.
 
 ## Cursor
@@ -56,8 +57,8 @@ Google의 소비자용 코딩 에이전트(`agy`)입니다. 정적 모델 카탈
 Cursor의 CLI로, Cursor 네이티브 모델과 리셀 모델(Composer, Grok 등)로 구성된
 라이브·메모이즈 카탈로그를 구동합니다. 헤드리스 실행은 기본적으로 `trust:
 true`를 사용해 워크스페이스 신뢰 프롬프트로 실행이 멈추지 않게 합니다.
-`quota()`는 의도적으로 `null`을 반환합니다. 자세한 내용은 [Cursor 어댑터
-페이지](/ko/adapters/cursor)를 참고하세요.
+`quota()`는 CLI 로그인 토큰으로 현재 결제 주기의 사용량(Total / Auto / API)을
+읽습니다. 자세한 내용은 [Cursor 어댑터 페이지](/ko/adapters/cursor)를 참고하세요.
 
 ::: warning 비공식
 agent-mesh는 Anthropic, OpenAI, Google, Cursor와 제휴 관계가 없습니다. 각 어댑터는 본인

@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.2
+
+`quota()` now reports Antigravity usage (it returned `null` by design), and
+`capabilities.quota` is `true`.
+
+- **Added: usage from `agy -p /usage`.** agy (≥ 1.1.11) answers its own `/usage`
+  command in print mode — `agy -p /usage --output-format json` — with no agent turn and
+  no quota spent, fetching the numbers with its own login; this library touches no
+  token. One window per enabled bucket, groups then buckets in order (`gemini-weekly`,
+  `gemini-5h`, `3p-weekly`, `3p-5h` on agy 1.3.5): `label` is the bucket id (else
+  `<group name> <window>`), `usedPercent` is `(1 − remaining_fraction) × 100` rounded to
+  one decimal and clamped to 0..100, `resetAt` is the RFC 3339 `reset_time` as ISO. A
+  disabled bucket, a bucket with only `remaining_amount` (or neither — an amount of 0
+  with no fraction is unknown, not exhausted), and a fraction above 1 are left out.
+  `allowed` is derived (no window at 100%); `raw` is `command.data`. Any failure — not
+  logged in, an API-key/ADC session, a non-zero exit, an `AGY_ERROR:` / `error:` line,
+  a status other than `SUCCESS`, another shape, no usable bucket, more than 1 MiB of
+  stdout, the timeout — resolves `null`. The child runs through the `exec` seam with
+  `run()`'s account env, stdin on `/dev/null`, and a private cwd
+  (`<os tmpdir>/agent-mesh-agy-usage`, 0700; refused when not private). New options:
+  `quotaTimeoutMs` (default 90 s; the whole process group is killed at it) and
+  `quotaCacheMs` (default 60 s; the outcome, snapshot or `null`, is reused per account).
+  At most one read per account is in flight per adapter instance.
+- **Added: two optional process-seam fields.** `ExecRequest.ignoreStdin` (the child's
+  stdin is the null device, not a pipe) and `ExecRequest.maxStdoutBytes` (`nodeExec`
+  stops the child's process group past it and sets `ExecResult.stdoutOverflow`). Both
+  are additive: a host's own `exec` that ignores them still works, and the adapter
+  re-checks the stdout size itself.
+- **Note: Antigravity account isolation — NOT provided by agy 1.3.5; all accounts share
+  the default login.** The agy 1.3.5 binary contains no `AGY_HOME` string, so the
+  `AGY_HOME` the adapter sets for `account.configDir` is not read: every account runs on
+  — and `quota()` reports the usage of — agy's default login, whose keychain item is
+  fixed. The note on results now says so (it said isolation was "unverified").
+
+All five packages move in lockstep, so this package is bumped to 0.1.2 with the Codex
+and Cursor quota fixes.
+
 ## 0.1.1
 
 No runtime changes in this package — the published tarball is identical to 0.1.0 apart from

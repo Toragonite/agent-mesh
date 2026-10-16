@@ -5,13 +5,14 @@
  * Runs `cursor-agent -p --output-format json` (one-shot), `--resume <id>` (revise
  * a conversation), and `-p --output-format stream-json --stream-partial-output`
  * (incremental events) under the user's own Cursor login. Introspection
- * (`authStatus`/`availableModels`) shells out to the CLI; `quota()` returns null
- * by design (Cursor exposes no verified usage endpoint).
+ * (`authStatus`/`availableModels`) shells out to the CLI; `quota()` reads the
+ * current billing period's usage with the CLI's own login token (see quota.ts).
  *
- * Every side-effecting seam — the run-to-completion exec, the line stream — is
- * injectable through the constructor, so the whole surface is testable with no
- * real CLI, no network, and no real home directory. No token or secret value
- * ever appears in a result, error, note, detail, or raw payload.
+ * Every side-effecting seam — the run-to-completion exec, the line stream, the
+ * file read, the network fetch — is injectable through the constructor, so the
+ * whole surface is testable with no real CLI, no network, and no real home
+ * directory. No token or secret value ever appears in a result, error, note,
+ * detail, or raw payload.
  *
  * Empirical ground truth this adapter is built on:
  * - The prompt is a trailing POSITIONAL and the CLI is commander-based, so a `--`
@@ -21,6 +22,7 @@
  * - `cursor-agent create-chat` mints a bare UUID; `--resume <id>` preserves context.
  * - A one-word answer takes ~30s — the slowest vendor in this repo.
  */
+import { readFile } from 'node:fs/promises';
 import {
   AdapterExecError,
   AgentMeshError,
@@ -40,8 +42,40 @@ import {
 import { nodeExec, nodeLineStream, type ExecFn, type LineStreamFn, type StreamEndMeta } from './exec.js';
 import { curatedModels, cloneModel, parseModelsOutput } from './models.js';
 import { isRecord, mapResultPayload, parseCursorJson, str, type MappedResult } from './parse.js';
+import { homedir } from 'node:os';
+import {
+  cursorAuthPaths,
+  credentialStoreKind,
+  defaultReadCursorKeychain,
+  readAccessToken,
+  readQuota,
+  type ReadKeychain,
+  type ReadTextFile,
+} from './quota.js';
 
 const VENDOR: Vendor = 'cursor';
+
+/** Default deadline for the quota fetch, in ms — the same bound the Codex adapter uses. */
+const DEFAULT_QUOTA_TIMEOUT_MS = 10_000;
+
+/**
+ * How long one interaction refusal from the keychain quiets further keychain reads,
+ * per adapter instance. A macOS keychain prompt the user denied (or a non-interactive
+ * session where `security` cannot show one) would otherwise recur on EVERY quota poll
+ * — once a minute on a dashboard — nagging the user forever. Six hours lets one denial
+ * settle the question for a working session while still recovering the same day; it is
+ * in memory only, so a fresh process asks again.
+ */
+const KEYCHAIN_REFUSAL_BACKOFF_MS = 6 * 60 * 60 * 1_000;
+
+/** Default file reader: contents as utf-8, or null on any read failure (e.g. ENOENT). */
+const defaultReadTextFile: ReadTextFile = async (path) => {
+  try {
+    return await readFile(path, 'utf8');
+  } catch {
+    return null;
+  }
+};
 
 /** Max stderr bytes attached to an AdapterExecError, so a failure is diagnosable without a flood. */
 const STDERR_CAP = 4_096;
@@ -65,9 +99,35 @@ export interface CursorAdapterOptions {
   /**
    * Environment seam and the base of the child env. Default: {@link process.env}.
    * Injecting it keeps introspection and execution resolving the same environment
-   * and lets tests avoid mutating global `process.env`.
+   * and lets tests avoid mutating global `process.env`. `quota()` resolves the
+   * login file's location from it (`XDG_CONFIG_HOME`, or `APPDATA` on Windows) and
+   * reads no file at all under `AGENT_CLI_CREDENTIAL_STORE=memory`.
    */
   env?: Record<string, string | undefined>;
+  /** File-read seam returning file contents or null when absent, used by `quota()`. Defaults to fs. */
+  readTextFile?: ReadTextFile;
+  /**
+   * macOS keychain-read seam used by `quota()`: resolves the `cursor-agent` CLI's
+   * access token from the login keychain, or a not-found/refused result. Defaults to
+   * {@link defaultReadCursorKeychain}, which spawns `/usr/bin/security`. Injected in
+   * tests so they never run the real `security`. Only CALLED on macOS under the CLI's
+   * default credential store (see `quota()`).
+   */
+  readKeychain?: ReadKeychain;
+  /**
+   * Platform override (default {@link process.platform}). Decides the login-file
+   * locations and whether the keychain is read at all; present so tests can drive the
+   * macOS and non-macOS paths on any host.
+   */
+  platform?: NodeJS.Platform;
+  /** Fetch seam for the quota endpoint. Defaults to the global fetch. */
+  fetchFn?: typeof fetch;
+  /**
+   * Deadline for the quota read, in milliseconds (default 10000). The request is
+   * aborted at this deadline so a hung endpoint cannot stall `Fleet.route()`; an
+   * abort resolves `null`, like every other quota failure.
+   */
+  quotaTimeoutMs?: number;
   /**
    * Whether to pass `--trust` (default TRUE). A library driving a headless agent
    * in a directory the CALLER chose must not stall ~21s per task on an interactive
@@ -154,7 +214,7 @@ export class CursorAdapter implements Adapter {
     resume: true,
     steer: 'turn',
     peerMesh: false,
-    quota: false,
+    quota: true,
     stream: true,
   };
 
@@ -163,7 +223,18 @@ export class CursorAdapter implements Adapter {
   private readonly binary: string;
   private readonly defaultAccount?: Account;
   private readonly env: Record<string, string | undefined>;
+  private readonly readTextFile: ReadTextFile;
+  private readonly readKeychain: ReadKeychain;
+  private readonly platform: NodeJS.Platform;
+  private readonly fetchFn: typeof fetch;
+  private readonly quotaTimeoutMs: number;
   private readonly trust: boolean;
+
+  /**
+   * Epoch-ms before which the keychain is NOT read, set after an interaction refusal
+   * (see {@link KEYCHAIN_REFUSAL_BACKOFF_MS}). In memory, per instance.
+   */
+  private keychainBackoffUntil = 0;
   private readonly modelsOption?: ModelInfo[];
   private readonly authTimeoutMs: number;
   private readonly modelsTimeoutMs: number;
@@ -182,6 +253,11 @@ export class CursorAdapter implements Adapter {
     this.binary = opts.binary ?? 'cursor-agent';
     this.defaultAccount = opts.defaultAccount;
     this.env = opts.env ?? process.env;
+    this.readTextFile = opts.readTextFile ?? defaultReadTextFile;
+    this.readKeychain = opts.readKeychain ?? defaultReadCursorKeychain;
+    this.platform = opts.platform ?? process.platform;
+    this.fetchFn = opts.fetchFn ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+    this.quotaTimeoutMs = opts.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS;
     this.trust = opts.trust ?? true;
     this.modelsOption = opts.models;
     this.authTimeoutMs = opts.authTimeoutMs ?? 20_000;
@@ -275,13 +351,61 @@ export class CursorAdapter implements Adapter {
   }
 
   /**
-   * Cursor exposes no verified usage endpoint, so quota is unconditionally `null`
-   * (and `capabilities.quota` is false). Fabricating `{allowed:true, windows:[]}`
-   * would tell the router an exhausted account has full headroom; null is the
-   * honest "headroom unknown" signal. Never throws.
+   * The current billing period's usage — windows `total` / `auto` / `api` — read
+   * with the account's own access token, straight from where the `cursor-agent` CLI
+   * keeps it: the macOS login keychain first (on macOS under the CLI's default
+   * store), then the CLI's login file. Runs only in the user's runtime; any failure
+   * (no credential, an expired token, network, non-2xx, the deadline, a body of
+   * another shape) resolves `null`, the honest "headroom unknown" signal — never a
+   * fabricated `{allowed:true, windows:[]}`. Never throws.
+   *
+   * The account is not consulted: cursor-agent has no config-dir isolation (see
+   * {@link resolveConfigDir}), and quota must resolve the same login run() uses.
    */
   async quota(_account?: Account): Promise<QuotaSnapshot | null> {
-    return null;
+    let authPaths: string[];
+    try {
+      authPaths = cursorAuthPaths(this.env, this.platform, homedir()); // homedir() can throw
+    } catch {
+      return null;
+    }
+    return readQuota(() => this.resolveToken(authPaths), this.fetchFn, this.quotaTimeoutMs);
+  }
+
+  /** True when the CLI keeps its token in the macOS keychain: macOS + the default store. */
+  private keychainEligible(): boolean {
+    return this.platform === 'darwin' && credentialStoreKind(this.env) === 'default';
+  }
+
+  /**
+   * The account's access token: the keychain first when the CLI keeps it there, then
+   * the login file(s). A keychain read that finds nothing — or is refused, or is
+   * backed off — falls through to the files, so a login kept in a file still works.
+   */
+  private async resolveToken(authPaths: string[]): Promise<string | undefined> {
+    if (this.keychainEligible()) {
+      const token = await this.tryKeychain();
+      if (token !== undefined) return token;
+    }
+    return readAccessToken(authPaths, this.readTextFile);
+  }
+
+  /**
+   * The keychain token, or undefined (not found, refused, backed off, or a reader
+   * that threw). An interaction refusal arms the backoff so a denied macOS prompt is
+   * not re-raised on every quota poll.
+   */
+  private async tryKeychain(): Promise<string | undefined> {
+    if (Date.now() < this.keychainBackoffUntil) return undefined;
+    let result;
+    try {
+      result = await this.readKeychain();
+    } catch {
+      return undefined; // a keychain reader that threw must never break quota()
+    }
+    if (result.found) return result.token;
+    if (result.refused) this.keychainBackoffUntil = Date.now() + KEYCHAIN_REFUSAL_BACKOFF_MS;
+    return undefined;
   }
 
   /* ----------------------------------------------------------------------- *

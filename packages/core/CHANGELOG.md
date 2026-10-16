@@ -3,6 +3,19 @@
 All notable changes to **@toragonite/agent-mesh** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2
+
+One additive type change; no runtime changes.
+
+- **`ModelInfo.efforts?: string[]`** — the reasoning-effort levels the vendor's own model
+  list says a model accepts (e.g. `'low'`, `'medium'`, `'high'`), in the vendor's order.
+  Optional: an absent field means "not reported", and adapters that never set it are
+  unaffected. The Codex adapter fills it from `codex app-server`'s `model/list`.
+
+This release also carries the Codex and Cursor quota fixes and the Codex live model list
+(`@toragonite/agent-mesh-codex`, `@toragonite/agent-mesh-cursor`). All five packages move
+in lockstep, so this package is bumped to 0.1.2 with the rest.
+
 ## 0.1.1
 
 No runtime changes in this package — the published tarball is identical to 0.1.0 apart from

@@ -5,7 +5,8 @@
  * dependency-free wrapper over `child_process.spawn` with `shell:false`, so a prompt or a
  * flag value never touches a command line and has no interpolation surface. Two shapes:
  * {@link nodeExec} collects a whole run into one buffer, {@link nodeLineStream} yields the
- * child's stdout line by line for streaming consumers.
+ * child's stdout line by line for streaming consumers. The Antigravity copy also honours
+ * `ignoreStdin` (both shapes) and `maxStdoutBytes` (nodeExec), which the usage read needs.
  *
  * Zero runtime dependencies: Node built-ins only (`child_process`, `readline`).
  */
@@ -18,6 +19,10 @@ import type { Readable, Writable } from 'node:stream';
  * One process invocation. When `env` is provided it IS the child env — it is NOT merged over
  * `process.env`; keys whose value is `undefined` are dropped. When `env` is omitted the child
  * inherits the parent env (spawn's default). The adapter composes the fully-resolved env.
+ *
+ * `ignoreStdin` and `maxStdoutBytes` are optional and additive: a host's own {@link ExecFn}
+ * that does not know them still works (stdin is then a pipe ended at once, and stdout is not
+ * capped while the child runs) — the adapter re-checks the stdout size itself.
  */
 export interface ExecRequest {
   cmd: string;
@@ -26,14 +31,31 @@ export interface ExecRequest {
   env?: Record<string, string | undefined>;
   timeoutMs?: number;
   stdin?: string;
+  /**
+   * When true the child's stdin is the null device (spawn's `'ignore'`) instead of a pipe,
+   * and `stdin` is not written. A CLI can tell a pipe from `/dev/null` — a common "is stdin
+   * piped?" test reads a pipe as input, while `/dev/null` is a character device — so a call
+   * that was verified against `/dev/null` must not be handed a pipe.
+   */
+  ignoreStdin?: boolean;
+  /**
+   * {@link nodeExec} only: keep at most this many bytes of stdout. The chunk that would cross
+   * the cap is dropped, the child's process group is killed (as on a timeout), and the result
+   * carries `stdoutOverflow: true` — so a runaway child cannot grow the parent's memory.
+   */
+  maxStdoutBytes?: number;
 }
 
-/** The settled outcome of a run. `exitCode` is null on a signal kill; `timedOut` flags the wall-clock cap. */
+/**
+ * The settled outcome of a run. `exitCode` is null on a signal kill; `timedOut` flags the
+ * wall-clock cap; `stdoutOverflow` is present (true) only when `maxStdoutBytes` tripped.
+ */
 export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  stdoutOverflow?: boolean;
 }
 
 /**
@@ -116,15 +138,21 @@ function buildEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv |
   return out;
 }
 
+/** A non-negative finite byte cap, or undefined when the request sets none (or a meaningless one). */
+function stdoutCap(x: unknown): number | undefined {
+  return typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : undefined;
+}
+
 /**
  * Run a child to completion, collecting stdout and stderr into separate buffers. Resolves the
  * {@link ExecResult}; a synchronous spawn throw or an async 'error' (e.g. ENOENT) REJECTS —
  * the adapter converts that into an AdapterExecError. On timeout the child is SIGTERMed, then
- * SIGKILLed after {@link KILL_GRACE_MS}, and the result resolves with `timedOut:true`.
+ * SIGKILLed after {@link KILL_GRACE_MS}, and the result resolves with `timedOut:true`. Past
+ * `maxStdoutBytes` the child is stopped the same way and the result has `stdoutOverflow:true`.
  */
 export const nodeExec: ExecFn = (req) =>
   new Promise<ExecResult>((resolve, reject) => {
-    let child: ChildProcessByStdio<Writable, Readable, Readable>;
+    let child: ChildProcessByStdio<Writable | null, Readable, Readable>;
     try {
       child = spawn(req.cmd, req.args, {
         cwd: req.cwd,
@@ -132,8 +160,8 @@ export const nodeExec: ExecFn = (req) =>
         shell: false,
         // Own process group so a timeout kill can reap the whole tree (see killProcessGroup).
         detached: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }) as ChildProcessByStdio<Writable, Readable, Readable>;
+        stdio: [req.ignoreStdin === true ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
     } catch (e) {
       reject(e as Error);
       return;
@@ -142,9 +170,13 @@ export const nodeExec: ExecFn = (req) =>
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let stdoutOverflow = false;
+    let stopping = false;
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
+    const maxStdout = stdoutCap(req.maxStdoutBytes);
+    let stdoutBytes = 0;
 
     const clearTimers = (): void => {
       if (timeoutTimer) {
@@ -155,15 +187,41 @@ export const nodeExec: ExecFn = (req) =>
       }
     };
 
+    /** SIGTERM the whole group, SIGKILL it after the grace — once, whichever cap tripped first. */
+    const stop = (): void => {
+      if (stopping) {
+        return;
+      }
+      stopping = true;
+      // Signal the whole group, not just the direct child, so inherited-pipe grandchildren die too.
+      killProcessGroup(child, 'SIGTERM');
+      killTimer = setTimeout(() => {
+        killProcessGroup(child, 'SIGKILL');
+      }, KILL_GRACE_MS);
+      killTimer.unref?.();
+    };
+
     // Ignore EPIPE on stdin when the child dies before we finish writing.
-    child.stdin.on('error', () => {
+    child.stdin?.on('error', () => {
       /* settle path owns the outcome */
     });
     // Streaming-safe UTF-8 decoding: a multi-byte char split across pipe chunks is
     // held over the boundary instead of each half decoding to U+FFFD (M1).
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (d) => {
+    child.stdout.on('data', (d: string) => {
+      if (stdoutOverflow) {
+        return; // past the cap: drop the rest while the group is being stopped
+      }
+      if (maxStdout !== undefined) {
+        const n = Buffer.byteLength(d, 'utf8');
+        if (stdoutBytes + n > maxStdout) {
+          stdoutOverflow = true;
+          stop();
+          return;
+        }
+        stdoutBytes += n;
+      }
       stdout += d;
     });
     child.stderr.on('data', (d) => {
@@ -178,10 +236,11 @@ export const nodeExec: ExecFn = (req) =>
       clearTimers();
       reject(e);
     });
-    // Belt-and-braces: once a timeout has tripped, drop our read ends as soon as the direct
-    // child exits so `'close'` fires promptly even if some inherited FD outlives the group kill.
+    // Belt-and-braces: once the child is being stopped (a timeout or the stdout cap), drop our
+    // read ends as soon as the direct child exits so `'close'` fires promptly even if some
+    // inherited FD outlives the group kill.
     child.on('exit', () => {
-      if (timedOut) {
+      if (stopping) {
         child.stdout?.destroy();
         child.stderr?.destroy();
       }
@@ -192,27 +251,25 @@ export const nodeExec: ExecFn = (req) =>
       }
       settled = true;
       clearTimers();
-      resolve({ stdout, stderr, exitCode: code, timedOut });
+      resolve({ stdout, stderr, exitCode: code, timedOut, ...(stdoutOverflow ? { stdoutOverflow: true } : {}) });
     });
 
     if (req.timeoutMs !== undefined && req.timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         timedOut = true;
-        // Signal the whole group, not just the direct child, so inherited-pipe grandchildren die too.
-        killProcessGroup(child, 'SIGTERM');
-        killTimer = setTimeout(() => {
-          killProcessGroup(child, 'SIGKILL');
-        }, KILL_GRACE_MS);
-        killTimer.unref?.();
+        stop();
       }, req.timeoutMs);
       timeoutTimer.unref?.();
     }
 
     try {
-      if (req.stdin !== undefined) {
-        child.stdin.write(req.stdin);
+      // With `ignoreStdin` there is no pipe: the child already reads the null device.
+      if (child.stdin) {
+        if (req.stdin !== undefined) {
+          child.stdin.write(req.stdin);
+        }
+        child.stdin.end();
       }
-      child.stdin.end();
     } catch {
       // stdin unwritable — the child's exit settles the outcome
     }
@@ -238,10 +295,10 @@ export async function* nodeLineStream(
     shell: false,
     // Own process group so a timeout kill can reap the whole tree (see killProcessGroup).
     detached: true,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  }) as ChildProcessByStdio<Writable, Readable, Readable>;
+    stdio: [req.ignoreStdin === true ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+  }) as ChildProcessByStdio<Writable | null, Readable, Readable>;
 
-  child.stdin.on('error', () => {
+  child.stdin?.on('error', () => {
     /* EPIPE if the child died first */
   });
 

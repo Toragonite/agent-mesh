@@ -99,10 +99,11 @@ describe('authStatus() via `agy models` (T19)', () => {
   });
 });
 
-describe('quota() — deliberate unknown headroom (T20)', () => {
-  it('returns null and advertises capabilities.quota false', async () => {
-    const a = new GeminiAdapter({ exec: recordingExec().exec, env: {} });
-    await expect(a.quota()).resolves.toBeNull();
-    expect(a.capabilities.quota).toBe(false);
+describe('quota() — agy reports its own usage (T20)', () => {
+  // The full mapping and failure matrix is in quota.test.ts.
+  it('advertises capabilities.quota true, and an answer that is not a usage answer is null', async () => {
+    const a = new GeminiAdapter({ exec: recordingExec().exec, env: {}, quotaCacheMs: 0 });
+    expect(a.capabilities.quota).toBe(true);
+    await expect(a.quota()).resolves.toBeNull(); // empty stdout: headroom unknown, never fabricated
   });
 });

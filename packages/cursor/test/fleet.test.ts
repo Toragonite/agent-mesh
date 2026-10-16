@@ -25,7 +25,18 @@ const other: Adapter = {
 };
 
 function buildCursor() {
-  return new CursorAdapter({ exec: recordingExec({ stdout: RESULT_JSON }).exec, env: {} });
+  // Fleet.route() reads quota(), so the file, keychain, and network seams are all
+  // stubbed: the defaults would otherwise read the real ~/.config login file or spawn
+  // the real `security` on a macOS host. Not-found → null, which the routing test wants.
+  return new CursorAdapter({
+    exec: recordingExec({ stdout: RESULT_JSON }).exec,
+    env: {},
+    readTextFile: async () => null,
+    readKeychain: async () => ({ found: false, refused: false }),
+    fetchFn: (async () => {
+      throw new Error('no network in tests');
+    }) as unknown as typeof fetch,
+  });
 }
 
 describe('Fleet e2e with CursorAdapter', () => {

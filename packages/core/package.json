@@ -1,6 +1,6 @@
 {
   "name": "@toragonite/agent-mesh",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "One interface to drive Claude, Codex, Antigravity (Gemini), and Cursor coding agents as headless workers — spawn, revise, read quota, route by strength/quota/latency. Unofficial.",
   "keywords": ["ai","agent","orchestration","claude","codex","gemini","antigravity","cursor","llm","cli"],
   "license": "MIT",

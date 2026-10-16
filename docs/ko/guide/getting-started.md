@@ -2,8 +2,8 @@
 
 > **상태:** 코어 계약은 동결되었습니다. `@toragonite/agent-mesh-claude`,
 > `@toragonite/agent-mesh-codex`, `@toragonite/agent-mesh-gemini`,
-> `@toragonite/agent-mesh-cursor` 네 어댑터 모두 코어와 함께 v0.1.0으로
-> 배포됩니다. 자세한 내용은 [어댑터](/ko/adapters/)를 참고하세요.
+> `@toragonite/agent-mesh-cursor` 네 어댑터 모두 코어와 함께 배포됩니다.
+> 자세한 내용과 현재 버전은 [어댑터](/ko/adapters/)를 참고하세요.
 
 ## 설치
 

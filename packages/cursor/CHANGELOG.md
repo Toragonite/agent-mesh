@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.1.2
+
+`quota()` now reports Cursor plan usage (it was a stub returning `null`), and
+`capabilities.quota` is `true`.
+
+- **The read:** `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`
+  (Connect-RPC over JSON: body `{}`, `Connect-Protocol-Version: 1`), authenticated with
+  the access token from the `cursor-agent` login file. The first file that exists is
+  the login: where the current CLI keeps its file store — `~/.cursor/auth.json` on
+  macOS, `$XDG_CONFIG_HOME/cursor/auth.json` (else `~/.config/…`) on Linux and other
+  Unixes, `%APPDATA%\Cursor\auth.json` on Windows — then the older `cursor-agent`
+  location (`$XDG_CONFIG_HOME/cursor-agent/auth.json`, else `~/.config/…`;
+  `%APPDATA%\Cursor-agent\auth.json` on Windows). `AGENT_CLI_CREDENTIAL_STORE=memory`
+  means the CLI keeps no file, so nothing is read and the result is `null`. Runs only
+  in your own runtime; the token is never logged, returned, or placed in `raw`. A JWT
+  whose `exp` has passed resolves `null` before any request — the CLI refreshes its
+  token when it runs, and this library never refreshes a credential.
+- **The snapshot:** windows `total` / `auto` / `api` from `planUsage.totalPercentUsed` /
+  `autoPercentUsed` / `apiPercentUsed` — the three bars Cursor's dashboard draws. They
+  are already percentages (0..100), read verbatim and clamped; a missing or non-numeric
+  one is left out, never reported as 0. Each window's `resetAt` is `billingCycleEnd`
+  (epoch milliseconds, as a number or digit string, or an ISO string). `allowed` is
+  derived (no window at 100%). `raw` keeps the whole body.
+- **macOS keychain:** on macOS, under the CLI's default credential store (i.e. not
+  `AGENT_CLI_CREDENTIAL_STORE=file` / `memory`), the `cursor-agent` CLI keeps the token
+  in the login keychain rather than in a file — so the adapter reads it there FIRST,
+  then falls back to the files. It reads it the way the CLI does: by spawning
+  `/usr/bin/security find-generic-password -a cursor-user -s cursor-access-token -w`
+  (no shell, a minimal `PATH`/`HOME`/`USER`/`LANG` environment, a 10s timeout that kills
+  it), and uses the token for one thing only — the usage request's `Authorization`
+  header. If macOS blocks or the user denies the access prompt (`security` exits 51/36,
+  or says interaction is not allowed / the user canceled), the adapter stops reading the
+  keychain for 6 hours (in memory, per instance) so a denied prompt is not re-raised on
+  every quota poll, and uses the files meanwhile.
+- **Failures:** no credential, unreadable or malformed data, no token, an expired
+  token, a network error, a non-2xx, the deadline, or a body of another shape all
+  resolve `null`; `quota()` never throws.
+- **New options:** `readTextFile`, `readKeychain`, `platform`, `fetchFn`, and
+  `quotaTimeoutMs` (default `10000`, aborting the request at the deadline) — so tests
+  never touch the real home directory, the real `security`, or the network.
+
 ## 0.1.1
 
 No runtime changes in this package — the published tarball is identical to 0.1.0 apart from

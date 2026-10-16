@@ -8,14 +8,14 @@ use.
 
 | Adapter | Package | CLI it drives | Status |
 |---|---|---|---|
-| Claude Code | `@toragonite/agent-mesh-claude` | `claude` | ✅ v0.1.0 |
-| Codex | `@toragonite/agent-mesh-codex` | `codex` | ✅ v0.1.0 |
-| Antigravity | `@toragonite/agent-mesh-gemini` | `agy` | ✅ v0.1.0 |
-| Cursor | `@toragonite/agent-mesh-cursor` | `cursor-agent` | ✅ v0.1.0 |
+| Claude Code | [`@toragonite/agent-mesh-claude`](https://www.npmjs.com/package/@toragonite/agent-mesh-claude) | `claude` | ✅ published |
+| Codex | [`@toragonite/agent-mesh-codex`](https://www.npmjs.com/package/@toragonite/agent-mesh-codex) | `codex` | ✅ published |
+| Antigravity | [`@toragonite/agent-mesh-gemini`](https://www.npmjs.com/package/@toragonite/agent-mesh-gemini) | `agy` | ✅ published |
+| Cursor | [`@toragonite/agent-mesh-cursor`](https://www.npmjs.com/package/@toragonite/agent-mesh-cursor) | `cursor-agent` | ✅ published |
 
 All four adapters are implemented and verified against their vendor's CLI, and
-all publish together with core at v0.1.0. Antigravity and Cursor are the
-newest of the four, so their per-model latency classes are still provisional.
+all publish together with core on the same release. Antigravity and Cursor are
+the newest of the four, so their per-model latency classes are still provisional.
 
 ## Capabilities
 
@@ -27,12 +27,13 @@ usage (the mandatory surface). The rest is declared per adapter via
 |---|---|---|---|---|---|
 | Claude Code | ✅ | `mid-run` | ✅ | ✅ | ✅ |
 | Codex | ✅ | `turn` | — | ✅ | — |
-| Antigravity | ✅ | `turn` | — | — | ✅ |
-| Cursor | ✅ | `turn` | — | — | ✅ |
+| Antigravity | ✅ | `turn` | — | ✅ | ✅ |
+| Cursor | ✅ | `turn` | — | ✅ | ✅ |
 
-Antigravity and Cursor both report `quota: false` — neither vendor exposes a
-verified usage endpoint, so `quota()` returns `null` by design instead of
-fabricating a snapshot (see each adapter's Quota section).
+Antigravity reports `quota: true` — `quota()` runs `agy -p /usage`, which the CLI
+answers with its own login and no agent turn, and returns the four usage windows
+(`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`), or `null` on any failure
+(see its Quota section).
 
 ## Claude Code
 
@@ -50,15 +51,16 @@ mode: a ChatGPT login and an API key expose different model sets, which
 
 Google's consumer coding agent (`agy`). A static model catalog (three entries
 resell other vendors' models), `stream()` support, and revision via
-resume-by-conversation-id. `quota()` returns `null` by design. See the
+resume-by-conversation-id. `quota()` reads the account's plan usage through `agy -p /usage`. See the
 [Antigravity adapter page](/adapters/gemini).
 
 ## Cursor
 
 Cursor's CLI, driving a live-and-memoized catalog of Cursor-native and resold
 models (Composer, Grok, and more). Headless runs default to `trust: true` so a
-workspace-trust prompt never stalls a run. `quota()` returns `null` by design.
-See the [Cursor adapter page](/adapters/cursor).
+workspace-trust prompt never stalls a run. `quota()` reads the current billing
+period's usage (Total / Auto / API) with the CLI's login token. See the
+[Cursor adapter page](/adapters/cursor).
 
 ::: warning Unofficial
 agent-mesh is not affiliated with Anthropic, OpenAI, Google, or Cursor. Each

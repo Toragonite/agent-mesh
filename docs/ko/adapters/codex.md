@@ -31,6 +31,9 @@ npm install @toragonite/agent-mesh @toragonite/agent-mesh-codex
 | `readTextFile` | `ReadTextFile` | fs 읽기 | `authStatus()`와 `quota()`가 사용하는 파일 읽기 seam. |
 | `fetchFn` | `typeof fetch` | 전역 `fetch` | 쿼터 엔드포인트용 fetch seam. |
 | `env` | `NodeJS.ProcessEnv` | `process.env` | 환경 변수 seam. |
+| `quotaTimeoutMs` | `number` | `10000` | 쿼터 조회의 최대 대기 시간. |
+| `modelsTimeoutMs` | `number` | `15000` | `codex app-server` 모델 목록 조회의 최대 대기 시간. 넘기면 프로세스 그룹을 종료합니다. |
+| `modelsCacheMs` | `number` | `60000` | 조회에 실패한 뒤 CLI에 다시 묻기 전까지 정적 카탈로그를 돌려주는 시간. |
 
 ## 실행과 재개
 
@@ -68,22 +71,55 @@ console.log(more.text)
 오판되지 않고 `loggedIn: false`가 됩니다. `mode: 'api-key'`는 `OPENAI_API_KEY`
 환경변수뿐 아니라, `auth.json` 안에 같은 키가 들어 있는 경우에도 성립합니다.
 
-ChatGPT 로그인에서는 범용 모델만 선택할 수 있고, `gpt-5.1-codex-max`와
-`gpt-5.2`는 API 키가 필요합니다. 로그아웃 상태에서는 각 로그인이 무엇을
-열어주는지 계속 조회할 수 있도록 주석이 달린 전체 카탈로그를 반환합니다. 어떤
-모델도 `default`로 표시되지 않습니다 — 작업이 모델을 지정하지 않으면 어댑터는
-`--model`을 생략하고 CLI가 자체 기본값을 적용합니다.
+### CLI가 직접 알려주는 목록
+
+`availableModels(account)`는 CLI에 묻습니다. 그 계정의 `CODEX_HOME`으로
+`codex app-server` 세션을 하나 열어 — stdio 위의 JSON-RPC 줄: `initialize` →
+`initialized` → `model/list`, `nextCursor`를 따라 최대 10페이지 — 각 항목을
+`ModelInfo`로 옮깁니다: `id`, `label`(표시 이름이 id와 다를 때), `default`(CLI의
+`isDefault`), `efforts`(`supportedReasoningEfforts`). 그다음 app-server의 stdin을
+닫아 세션을 끝내며, app-server가 스스로 종료해야만 목록으로 인정합니다.
+`modelsTimeoutMs`(기본 15초) 안에 응답하지 않거나 종료하지 않으면 프로세스 그룹을
+종료합니다. 자식 프로세스 환경은 어댑터의 env에서 `ANTHROPIC_*` / `CLAUDE_*` /
+`CLAUDECODE` 변수를 모두 뺀 것입니다. 성공한 목록은 `CODEX_HOME`별로 메모이즈되고,
+실패하면 `modelsCacheMs` 뒤에 다시 묻습니다.
+
+어떤 실패든 — `codex` 미설치, JSON-RPC 오류, 깨진 줄, 이르거나 0이 아닌 종료,
+타임아웃 — 아래 정적 카탈로그를 대신 반환합니다. `availableModels()`는 예외를
+던지지도, 멈추지도 않습니다. `fetchLiveModels()`는 같은 조회를 단독으로 수행하며
+실패하면 `[]`를 반환하므로, 호출자가 실제 응답과 대체 목록을 구분할 수 있습니다:
+
+```ts
+import { fetchLiveModels } from '@toragonite/agent-mesh-codex'
+const live = await fetchLiveModels({ codexHome: '/path/to/codex-home' }) // 실패하면 []
+```
+
+두 목록 모두 같은 방식으로 게이팅됩니다. ChatGPT 로그인에서는 범용 모델만 선택할
+수 있고, `gpt-5.1-codex-max`와 `gpt-5.2`는 API 키가 필요합니다. 로그아웃
+상태에서는 각 로그인이 무엇을 열어주는지 계속 조회할 수 있도록 주석이 달린 전체
+목록을 반환합니다. 작업이 모델을 지정하지 않으면 어댑터는 `--model`을 생략하고
+CLI가 자체 기본값을 적용합니다. `run()`/`resume()`의 스폰 전 검사는 정적
+카탈로그를 쓰며 app-server를 띄우지 않습니다.
+
+### 정적 카탈로그
+
+`STATIC_MODELS` — 2026-10-14에 `codex app-server`가 알려준 목록과 API 키 전용
+변형:
 
 | 모델 | 지연시간¹ | 사용 가능한 로그인 |
 |---|---|---|
+| `gpt-6.1-sol` | fast | ChatGPT 로그인, API 키 (기본값) |
+| `gpt-6-astra` | fast | ChatGPT 로그인, API 키 |
+| `gpt-6-sol` | fast | ChatGPT 로그인, API 키 |
+| `gpt-6-luna` | fast | ChatGPT 로그인, API 키 |
 | `gpt-5.6-sol` | fast | ChatGPT 로그인, API 키 |
 | `gpt-5.6-terra` | fast | ChatGPT 로그인, API 키 |
 | `gpt-5.6-luna` | fast | ChatGPT 로그인, API 키 |
-| `gpt-5.5` | fast | ChatGPT 로그인, API 키 |
 | `gpt-5.1-codex-max` | slow | API 키 전용 |
 | `gpt-5.2` | slow | API 키 전용 |
 
-¹ 지연시간 클래스는 실측이 아닌 잠정(미검증) 추정치입니다.
+¹ 지연시간 클래스는 실측이 아닌 잠정(미검증) 추정치입니다. 카탈로그에 없는 실제
+목록 항목은 `fast`로 분류합니다.
 
 ## 쿼터
 

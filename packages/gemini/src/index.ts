@@ -3,9 +3,9 @@
  *
  * Drives the official `agy` CLI headlessly behind the agent-mesh `Adapter`
  * contract: one-shot runs, resume-by-id, incremental streaming, a fast static
- * model catalog (plus a slow authoritative live probe), and an `agy models`-based
- * auth check. Antigravity exposes no verified quota endpoint, so `quota()` is
- * `null` by design. Unofficial.
+ * model catalog (plus a slow authoritative live probe), an `agy models`-based
+ * auth check, and a `quota()` read from agy's own `/usage` command
+ * (`agy -p /usage --output-format json` — no agent turn, no quota spent). Unofficial.
  */
 export { GeminiAdapter, type GeminiAdapterOptions } from './adapter.js';
 export {

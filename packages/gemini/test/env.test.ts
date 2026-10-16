@@ -14,13 +14,17 @@ describe('child env / account precedence (T21)', () => {
     expect(calls[0]!.env?.AGY_HOME).toBeUndefined();
   });
 
-  it('overlays AGY_HOME from the account configDir and notes it', async () => {
+  it('overlays AGY_HOME from the account configDir and notes that agy does not read it', async () => {
     const { exec, calls } = recordingExec({ stdout: OK });
     const a = new GeminiAdapter({ exec, env: { KEEP: 'yes' } });
     const r = await a.run({ prompt: 'hi', account: { vendor: 'gemini', configDir: '/acct/home' } });
     expect(calls[0]!.env).toEqual({ KEEP: 'yes', AGY_HOME: '/acct/home' });
     expect(r.note).toContain('passed as AGY_HOME');
-    expect(r.note).toContain('unverified');
+    // agy 1.3.5 contains no AGY_HOME string: the note says so, not "unverified".
+    expect(r.note).toContain('agy 1.3.5 does not read');
+    expect(r.note).toContain('isolation is not provided');
+    expect(r.note).toContain('default agy login');
+    expect(r.note).not.toContain('unverified');
   });
 
   it('an explicit account without configDir resolves ambient, NOT the defaultAccount configDir', async () => {

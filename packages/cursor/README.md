@@ -233,12 +233,56 @@ throws and never emits token material.
 
 ## Quota
 
-`quota()` returns **`null` unconditionally**, and `capabilities.quota` is
-`false`. Cursor exposes no verified usage endpoint; fabricating
-`{ allowed: true, windows: [] }` would tell the router an exhausted account has
-full headroom. `null` is the honest **"headroom unknown"** signal — the Fleet
-treats it as "not disqualified", so a Cursor adapter still routes, it just cannot
-be quota-ranked against vendors that report usage.
+`quota()` runs **only in your own runtime**, authenticated with your own
+`cursor-agent` login — it is never proxied through a server — and
+`capabilities.quota` is `true`. It reads the access token from wherever the CLI
+keeps it and calls Cursor's dashboard endpoint `GetCurrentPeriodUsage`.
+
+**On macOS**, under the CLI's default credential store, the token lives in the
+**login keychain**, so the adapter reads it there **first**. It reads it the same
+way the CLI does — spawning `/usr/bin/security find-generic-password -a
+cursor-user -s cursor-access-token -w` (no shell, a minimal
+`PATH`/`HOME`/`USER`/`LANG` environment, a 10s timeout) — to fetch the keychain
+item **`cursor-access-token`** (account **`cursor-user`**), and uses it **only** as
+the `Authorization` header of the one usage request. If macOS blocks or you deny
+the access prompt (`security` exits 51/36, or reports interaction is not allowed /
+canceled), the adapter stops reading the keychain for **6 hours** (in memory, per
+instance) so a denied prompt is not re-raised on every quota poll, and falls back
+to the files. `AGENT_CLI_CREDENTIAL_STORE=file` or `=memory` skips the keychain.
+
+**The login file** is read next (and is the only source off macOS). The first of
+these that exists is the login:
+
+| Platform | 1. the CLI's file store | 2. the older location |
+| --- | --- | --- |
+| macOS | `~/.cursor/auth.json` | `$XDG_CONFIG_HOME/cursor-agent/auth.json` (else `~/.config/…`) |
+| Linux and other Unixes | `$XDG_CONFIG_HOME/cursor/auth.json` (else `~/.config/…`) | `$XDG_CONFIG_HOME/cursor-agent/auth.json` (else `~/.config/…`) |
+| Windows | `%APPDATA%\Cursor\auth.json` | `%APPDATA%\Cursor-agent\auth.json` |
+
+An existing first file is authoritative — if it holds no usable token, the older
+file is not consulted. Under `AGENT_CLI_CREDENTIAL_STORE=memory` the CLI keeps no
+file, so nothing is read and `quota()` returns `null`. The request is bounded by
+`quotaTimeoutMs` (default 10s) and aborts at that deadline. A token that is an
+expired JWT resolves `null` without a request — the CLI refreshes its token when
+it runs; this adapter never refreshes one.
+
+- **Windows:** `total`, `auto` (first-party models), and `api` — the three bars
+  Cursor's dashboard shows (`planUsage.totalPercentUsed` / `autoPercentUsed` /
+  `apiPercentUsed`). They are already **percentages on a 0..100 scale** (not
+  fractions, and not `spend / limit` — the denominator is Cursor's own), reported
+  verbatim and clamped. A percentage the response omits is **left out**, never
+  reported as 0.
+- **`resetAt`:** the end of the billing cycle (`billingCycleEnd`) on every window.
+- **`allowed`:** derived — `false` once any window reaches 100%.
+- **`raw`:** the whole response body (its spend figures are in cents).
+
+Any failure — no credential, unreadable or malformed data, no token, an expired
+token, a network error, a non-2xx, the deadline, or a body of another shape —
+returns **`null`** rather than throwing, the honest **"headroom unknown"** signal;
+the token is never logged, returned, or included in the snapshot (it reaches only
+the request header). `account.configDir` is not consulted, so `quota()` reads the
+same login `run()` uses. Inject `readTextFile`, `readKeychain`, `fetchFn`, `env`
+and `platform` to test it hermetically.
 
 ## Pre-allocating a conversation id
 

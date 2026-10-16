@@ -36,6 +36,8 @@ and is overridable for testing:
 | `defaultAccount` | `Account` | — | Account used when a call passes none. Its `configDir` sets `AGY_HOME` (undocumented for `agy`; see [Behaviour notes](#behaviour-notes)). |
 | `env` | `Record<string, string \| undefined>` | `process.env` | Environment seam — the base of every child env and every env read. |
 | `authTimeoutMs` | `number` | `20000` | Wall-clock cap for the `agy models` auth probe. |
+| `quotaTimeoutMs` | `number` | `90000` | Wall-clock cap for the `agy -p /usage` read behind `quota()`. |
+| `quotaCacheMs` | `number` | `60000` | How long a `quota()` outcome (snapshot or `null`) is reused per account; `0` disables the cache. |
 
 ## Run and resume
 
@@ -154,14 +156,57 @@ routing path — only `availableModels()` (static) is.
 
 ## Quota
 
-`quota()` returns `null` unconditionally, and `capabilities.quota` is `false`.
-Antigravity exposes no usage endpoint that has been verified. This is a
-deliberate "unknown headroom" signal, not a stub filled in casually:
-fabricating `{ allowed: true, windows: [] }` would tell the Fleet's router
-that an exhausted account has full headroom. Returning `null` instead means
-the router treats Gemini's headroom as **unconfirmed** rather than believing a
-fabricated full tank — it still considers the adapter, just without
-quota-ranking it against vendors that report real usage. Never throws.
+`quota()` asks `agy` itself. It runs `agy -p /usage --output-format json`, which
+`agy` (1.1.11 and later) answers in print mode **without an agent turn and
+without spending quota** — `agy` fetches the numbers with its own login, so this
+adapter never reads, holds, or refreshes a token. `capabilities.quota` is
+`true`.
+
+```ts
+const snap = await new GeminiAdapter().quota()
+// { vendor: 'gemini', allowed: true, windows: [
+//     { label: 'gemini-weekly', usedPercent: 0, resetAt: '2026-10-20T07:57:54.000Z' },
+//     { label: 'gemini-5h',     usedPercent: 0, resetAt: '2026-10-15T15:10:03.000Z' },
+//     { label: '3p-weekly',     usedPercent: 0, resetAt: '2026-10-22T10:10:03.000Z' },
+//     { label: '3p-5h',         usedPercent: 0, resetAt: '2026-10-15T15:10:03.000Z' } ],
+//   raw: { groups: [...] } }
+```
+
+- **Windows.** One per enabled bucket, groups in order, then buckets in order.
+  On agy 1.3.5 the "Gemini Models" group has `gemini-weekly` and `gemini-5h`,
+  and the "Claude and GPT models" group (the resold models) has `3p-weekly` and
+  `3p-5h`. `label` is the bucket id (else `<group name> <window>`).
+  `usedPercent` is `(1 − remaining_fraction) × 100`, rounded to one decimal and
+  clamped to 0..100. `resetAt` is the bucket's RFC 3339 `reset_time` as an ISO
+  instant.
+- **Left out, never reported as 0.** A disabled bucket; a bucket that carries
+  only a `remaining_amount` (there is no limit to divide it by) or neither field
+  (an amount of 0 with no fraction is unknown, not exhausted); a
+  `remaining_fraction` above 1.
+- **`allowed`** is derived per model group's windows: `false` when any window is
+  at 100%. That includes the resold-model windows, so an exhausted `3p-*` window
+  gates the whole adapter. `raw` is the `command.data` object.
+- **`null` ("headroom unknown") on any failure** — not logged in, an
+  API-key / ADC session, a non-zero exit, an `AGY_ERROR:` or `error:` line, a
+  status other than `SUCCESS`, a body of another shape, no usable bucket, more
+  than 1 MiB of stdout, or the timeout. The Fleet treats `null` as "headroom
+  unconfirmed" and still considers the adapter; it is never a fabricated
+  `{ allowed: true, windows: [] }`. `quota()` never throws.
+- **Cost and bounds.** Each read boots `agy`'s language server (a few seconds).
+  The read times out after **90 s** (`quotaTimeoutMs`; the whole process group
+  is killed). Its outcome — snapshot or `null` — is cached for **60 s**
+  (`quotaCacheMs`; `0` turns the cache off). Per adapter instance and per
+  account at most **one** read runs at a time (a concurrent caller waits for
+  it). The child is started through the adapter's `exec` seam with the same
+  account env as `run()`, stdin on `/dev/null`, and a private working directory,
+  `<os tmpdir>/agent-mesh-agy-usage` (created `0700`; refused when it is not
+  private).
+
+::: warning Account isolation is not provided
+`agy` 1.3.5 does not read `AGY_HOME`, so every account — including the one
+`quota()` reports on — shares `agy`'s default login. See
+[Behaviour notes](#behaviour-notes).
+:::
 
 ## Behaviour notes
 
@@ -175,11 +220,14 @@ quota-ranking it against vendors that report real usage. Never throws.
 - **`allowedTools` is ignored.** `agy` has no equivalent flag, so
   `task.allowedTools` is dropped and the result carries an `allowedTools not
   supported by agy; ignored` note.
-- **`account.configDir` → `AGY_HOME`.** There is no documented config-dir env
-  var for `agy`. When you pass `account.configDir`, the adapter sets `AGY_HOME`
-  to it and adds a note that Antigravity account isolation via this variable is
-  **unverified**. An explicitly passed `account` with no `configDir` means the
-  ambient login and does not inherit a default account's directory.
+- **Account isolation is not provided by agy 1.3.5; all accounts share the
+  default login.** There is no documented config-dir env var for `agy`, and the
+  agy 1.3.5 binary contains no `AGY_HOME` string. When you pass
+  `account.configDir`, the adapter still sets `AGY_HOME` to it (so an agy that
+  reads it some day gets it) and adds a note that agy 1.3.5 does not read it —
+  but every account runs on, and `quota()` reports the usage of, `agy`'s default
+  login. An explicitly passed `account` with no `configDir` means the ambient
+  login and does not inherit a default account's directory.
 - **Latency.** A one-word answer is observed at **12–15 seconds** (versus ~5s
   for Claude Code/Codex); `agy`'s own `--print-timeout` defaults to `5m0s`. Set
   `timeoutMs` generously — a timeout resolves `status: 'incomplete'` (it never

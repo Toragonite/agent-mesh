@@ -36,7 +36,9 @@ console.log(more.text);
 
 `new CodexAdapter(opts?)` accepts injectable seams (`exec`, `binary`,
 `defaultAccount`, `readTextFile`, `fetchFn`, `env`), each with a real default,
-plus `quotaTimeoutMs` (default `10000`) bounding the quota fetch.
+plus `quotaTimeoutMs` (default `10000`) bounding the quota fetch, and
+`modelsTimeoutMs` (default `15000`) / `modelsCacheMs` (default `60000`) for the
+live model listing (see [Models](#auth-gated-models)).
 
 ### Resuming in a working directory
 
@@ -67,26 +69,57 @@ dropped and reported via `RunResult.note`.
 
 ## Auth-gated models
 
-`availableModels()` is auth-mode aware. Under a ChatGPT login only the universal
-models are selectable; the `-codex-max` variant and `gpt-5.2` require an API key.
-When logged out, the full annotated catalog is returned for introspection.
+`availableModels(account)` asks the CLI itself. It opens one `codex app-server`
+session with that account's `CODEX_HOME` (JSON-RPC over stdio: `initialize` →
+`initialized` → `model/list`, following `nextCursor` for at most 10 pages), maps
+each entry to a `ModelInfo` — `id`, `label` (the display name, when it differs),
+`default` (the CLI's `isDefault`), and `efforts` (the model's supported reasoning
+efforts) — then ends the session by closing the app-server's stdin. The listing
+counts only when the app-server then exits by itself; if it does not answer or
+does not exit within `modelsTimeoutMs` (default 15s), its process group is killed.
+The child env is yours minus every `ANTHROPIC_*` / `CLAUDE_*` / `CLAUDECODE`
+variable. A successful listing is memoized per `CODEX_HOME` for the life of the
+adapter; a failed one is retried after `modelsCacheMs` (default 60s).
+
+On any failure — `codex` not installed, a JSON-RPC error, a malformed line, an
+early or non-zero exit, the deadline — `availableModels()` returns the static
+catalog below instead. It never throws and never hangs. `fetchLiveModels()` is the
+same listing on its own: it returns `[]` on any failure, so you can tell a live
+answer from the fallback.
+
+```ts
+import { fetchLiveModels } from '@toragonite/agent-mesh-codex';
+const live = await fetchLiveModels({ codexHome: '/path/to/codex-home' }); // [] on any failure
+```
+
+Both lists are auth-mode gated the same way. Under a ChatGPT login only the
+universal models are selectable; the `-codex-max` variant and `gpt-5.2` require an
+API key. When logged out, the full annotated list is returned for introspection.
 
 `run()` and `resume()` validate `model` against the current login before spawning:
 a model that the login cannot select (e.g. an api-key-only model under a ChatGPT
-login) throws an `AgentMeshError`; an id that is not in the known catalog runs
-anyway and is flagged via `RunResult.note`.
+login) throws an `AgentMeshError`; an id that is not in the static catalog runs
+anyway and is flagged via `RunResult.note`. (This check never spawns the
+app-server.)
+
+The static catalog (`STATIC_MODELS`) — what `codex app-server` listed on
+2026-10-14, plus the API-key-only variants:
 
 | Model               | Latency¹ | Available under        |
 | ------------------- | -------- | ---------------------- |
+| `gpt-6.1-sol`       | fast     | ChatGPT login, API key (the default) |
+| `gpt-6-astra`       | fast     | ChatGPT login, API key |
+| `gpt-6-sol`         | fast     | ChatGPT login, API key |
+| `gpt-6-luna`        | fast     | ChatGPT login, API key |
 | `gpt-5.6-sol`       | fast     | ChatGPT login, API key |
 | `gpt-5.6-terra`     | fast     | ChatGPT login, API key |
 | `gpt-5.6-luna`      | fast     | ChatGPT login, API key |
-| `gpt-5.5`           | fast     | ChatGPT login, API key |
 | `gpt-5.1-codex-max` | slow     | API key only           |
 | `gpt-5.2`           | slow     | API key only           |
 
-¹ Latency class is a provisional (unverified) estimate. No model is marked as
-the default — when a task names no model, the CLI applies its own default.
+¹ Latency class is a provisional (unverified) estimate; a live entry the catalog
+does not know is classed `fast`. When a task names no model, the adapter omits
+`--model` and the CLI applies its own default.
 
 ## Quota
 
@@ -95,9 +128,12 @@ login — it is never proxied through a server. It reads the bearer token from
 `<CODEX_HOME>/auth.json` and calls the backend usage endpoint. The request is
 bounded by `quotaTimeoutMs` (default 10s) and aborts at that deadline so a hung
 endpoint cannot stall routing. Any failure (no login, no token, network/parse
-error, or the deadline) returns `null` rather than throwing. When the body omits
-`allowed`, it is derived — a fully-consumed window (≥ 100%) means new work is
-refused. The token is never logged, returned, or included in the snapshot.
+error, or the deadline) returns `null` rather than throwing. The windows
+(`primary`, `secondary`) are read from the body's `rate_limit` record (an older
+body's top-level windows are still read). When it omits `allowed`, the inverse of
+its `limit_reached` is used; when both are absent, it is derived — a
+fully-consumed window (≥ 100%) means new work is refused. The token is never
+logged, returned, or included in the snapshot.
 
 ## Accounts
 

@@ -6,7 +6,8 @@
  * conversation id (`agy --conversation <id> ...`), incremental `stream()`
  * (`--output-format stream-json`), plus introspection. Auth and the live model
  * list both go through the one probe Antigravity exposes — `agy models` — because
- * there is no readable local auth file and no status/login subcommand.
+ * there is no readable local auth file and no status/login subcommand. Usage comes
+ * from agy itself: `agy -p /usage --output-format json` (see quota.ts).
  *
  * Every side-effecting seam (process exec, line streaming, env) is injectable
  * through the constructor with a real default, so the whole adapter is testable
@@ -32,16 +33,32 @@ import {
 import { nodeExec, nodeLineStream, type ExecFn, type LineStreamFn, type StreamEndMeta } from './exec.js';
 import { isRecord, mapPayload, pickLastJsonObject, type MappedPayload } from './parse.js';
 import { isKnownModel, parseModelsOutput, staticModels } from './models.js';
+import { DEFAULT_QUOTA_CACHE_MS, DEFAULT_QUOTA_TIMEOUT_MS, readAgyUsage } from './quota.js';
 
 const VENDOR: Vendor = 'gemini';
 
 /** Max stderr bytes attached to an AdapterExecError, so a failure is diagnosable without a flood. */
 const STDERR_CAP = 4_096;
 
+/** The largest delay a Node timer honours; a longer one fires after 1 ms instead. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * How long a quota() caller waits past `quotaTimeoutMs` for the seam to settle before it
+ * resolves `null` anyway: nodeExec needs up to its 5 s SIGTERM→SIGKILL grace, and a host
+ * seam that ignores `timeoutMs` must not hang every later quota() behind the single flight.
+ */
+const QUOTA_SETTLE_GRACE_MS = 10_000;
+
 /** The pre-spawn notes with fixed text. */
 const ALLOWED_TOOLS_NOTE = 'allowedTools not supported by agy; ignored';
+/**
+ * The agy 1.3.5 binary contains no `AGY_HOME` string: the variable is set (so a later
+ * agy that reads it gets it) but nothing reads it today, so every account runs on —
+ * and quota() reports the usage of — agy's default login, whose keychain item is fixed.
+ */
 const AGY_HOME_NOTE =
-  'account.configDir is passed as AGY_HOME; Antigravity account isolation is unverified';
+  'account.configDir is passed as AGY_HOME, which agy 1.3.5 does not read; Antigravity account isolation is not provided: every account uses the default agy login';
 
 export interface GeminiAdapterOptions {
   /** Run-to-completion process seam. Default: {@link nodeExec}. */
@@ -50,7 +67,10 @@ export interface GeminiAdapterOptions {
   lineStream?: LineStreamFn;
   /** The `agy` executable path or command name. Default: `'agy'`. */
   binary?: string;
-  /** Account used when a call passes none. Its `configDir` sets `AGY_HOME`. */
+  /**
+   * Account used when a call passes none. Its `configDir` sets `AGY_HOME` — which agy
+   * 1.3.5 does not read, so it does not select a different login (see `AGY_HOME_NOTE`).
+   */
   defaultAccount?: Account;
   /**
    * Environment seam — the base of every child env and every env read. Default:
@@ -60,6 +80,43 @@ export interface GeminiAdapterOptions {
   env?: Record<string, string | undefined>;
   /** Wall-clock cap for the `agy models` auth probe. Default: 20000. */
   authTimeoutMs?: number;
+  /**
+   * Wall-clock cap for one `agy -p /usage` read behind `quota()`, in ms (default 90000).
+   * The seam kills the child's whole process group at it and the read resolves `null`.
+   * A non-positive or non-finite value means the default — the read is never unbounded.
+   */
+  quotaTimeoutMs?: number;
+  /**
+   * How long one read's outcome — the snapshot OR `null` — is reused for the same
+   * account, in ms (default 60000; 0 disables the cache). Either way at most one read
+   * per account is in flight per adapter instance: a concurrent caller awaits it.
+   */
+  quotaCacheMs?: number;
+}
+
+/** A positive finite timeout (capped to what a Node timer honours), else the default. */
+function positiveMs(x: unknown, fallback: number): number {
+  return typeof x === 'number' && Number.isFinite(x) && x > 0 ? Math.min(x, MAX_TIMER_MS) : fallback;
+}
+
+/** A caller-owned copy: the cached snapshot's windows can never be mutated through a result. */
+function cloneSnapshot(s: QuotaSnapshot | null): QuotaSnapshot | null {
+  return s ? { ...s, windows: s.windows.map((w) => ({ ...w })) } : null;
+}
+
+/**
+ * `pending`, or `null` once `ms` pass first. The timer is armed at once (before the
+ * caller awaits anything) and cleared as soon as `pending` settles.
+ */
+function withDeadline(pending: Promise<QuotaSnapshot | null>, ms: number): Promise<QuotaSnapshot | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+  return Promise.race([pending, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function isNonEmpty(x: unknown): x is string {
@@ -134,7 +191,7 @@ export class GeminiAdapter implements Adapter {
     resume: true,
     steer: 'turn',
     peerMesh: false,
-    quota: false,
+    quota: true,
     stream: true,
   };
 
@@ -144,6 +201,17 @@ export class GeminiAdapter implements Adapter {
   private readonly defaultAccount?: Account;
   private readonly env: Record<string, string | undefined>;
   private readonly authTimeoutMs: number;
+  private readonly quotaTimeoutMs: number;
+  private readonly quotaCacheMs: number;
+
+  /** Per account key (see {@link quotaKey}): the last read's outcome and when it arrived. */
+  private readonly quotaCache = new Map<string, { at: number; value: QuotaSnapshot | null }>();
+  /**
+   * Per account key: the read in flight. It is removed only when the read itself settles
+   * — not when a caller's deadline gives up on it — so a second agy is never started for
+   * an account while the first is still running.
+   */
+  private readonly quotaInFlight = new Map<string, Promise<QuotaSnapshot | null>>();
 
   constructor(opts: GeminiAdapterOptions = {}) {
     this.exec = opts.exec ?? nodeExec;
@@ -152,6 +220,10 @@ export class GeminiAdapter implements Adapter {
     this.defaultAccount = opts.defaultAccount;
     this.env = opts.env ?? process.env;
     this.authTimeoutMs = opts.authTimeoutMs ?? 20_000;
+    this.quotaTimeoutMs = positiveMs(opts.quotaTimeoutMs, DEFAULT_QUOTA_TIMEOUT_MS);
+    const cacheMs = opts.quotaCacheMs;
+    this.quotaCacheMs =
+      typeof cacheMs === 'number' && !Number.isNaN(cacheMs) && cacheMs >= 0 ? cacheMs : DEFAULT_QUOTA_CACHE_MS;
   }
 
   /* ----------------------------------------------------------------------- *
@@ -190,13 +262,45 @@ export class GeminiAdapter implements Adapter {
   }
 
   /**
-   * Always `null`. Antigravity exposes no verified usage endpoint, and
-   * `capabilities.quota` is `false`. This is a DELIBERATE "unknown headroom" signal,
-   * not a stub to fill in casually: fabricating `{allowed:true, windows:[]}` would
-   * tell the router an exhausted account has full headroom. Never throws.
+   * The account's usage, as agy reports it itself: `agy -p /usage --output-format
+   * json`, which agy (≥ 1.1.11) answers in print mode without an agent turn and
+   * without spending quota. One window per enabled bucket (`gemini-weekly`,
+   * `gemini-5h`, `3p-weekly`, `3p-5h` on agy 1.3.5); see quota.ts for the mapping.
+   * Any failure resolves `null`, the honest "headroom unknown" signal — never a
+   * fabricated `{allowed:true, windows:[]}`. Never throws.
+   *
+   * The child is started through the `exec` seam (as run() is), with the account's env
+   * exactly as run() builds it, stdin on the null device, and a private cwd. Each read
+   * boots agy's language server, so per adapter instance and per account there is at
+   * most ONE read in flight (a concurrent caller awaits it), and its outcome is reused
+   * for `quotaCacheMs`. A caller never waits past `quotaTimeoutMs` plus a settle grace,
+   * even through a seam that ignores the timeout.
+   *
+   * Which login: the account's `configDir` reaches agy as `AGY_HOME`, which agy 1.3.5
+   * does not read — so every account reports agy's DEFAULT login's usage.
    */
-  async quota(_account?: Account): Promise<QuotaSnapshot | null> {
-    return null;
+  async quota(account?: Account): Promise<QuotaSnapshot | null> {
+    try {
+      const { env } = this.childEnv(account);
+      const key = this.quotaKey(env);
+      const cached = this.quotaCache.get(key);
+      if (cached && Date.now() - cached.at < this.quotaCacheMs) return cloneSnapshot(cached.value);
+      let pending = this.quotaInFlight.get(key);
+      if (!pending) {
+        pending = readAgyUsage({ exec: this.exec, binary: this.binary, env, timeoutMs: this.quotaTimeoutMs })
+          .catch(() => null) // readAgyUsage never rejects; belt-and-braces
+          .then((value) => {
+            if (this.quotaCacheMs > 0) this.quotaCache.set(key, { at: Date.now(), value });
+            return value;
+          })
+          .finally(() => this.quotaInFlight.delete(key));
+        this.quotaInFlight.set(key, pending);
+      }
+      const deadlineMs = Math.min(this.quotaTimeoutMs + QUOTA_SETTLE_GRACE_MS, MAX_TIMER_MS);
+      return cloneSnapshot(await withDeadline(pending, deadlineMs));
+    } catch {
+      return null;
+    }
   }
 
   /* ----------------------------------------------------------------------- *
@@ -438,11 +542,20 @@ export class GeminiAdapter implements Adapter {
   }
 
   /**
+   * The quota cache / single-flight key for a resolved child env: the `AGY_HOME` the child
+   * would see ('' for none). Two calls key alike exactly when run() would hand agy the same
+   * account directory — today agy reads none of them (see `AGY_HOME_NOTE`).
+   */
+  private quotaKey(env: Record<string, string | undefined>): string {
+    return env.AGY_HOME ?? '';
+  }
+
+  /**
    * Compose the fully resolved child env for a call, plus the AGY_HOME note when one
    * applies. Account precedence: an explicitly passed `account` is authoritative — with
    * no `configDir` it means AMBIENT and does NOT fall back to `defaultAccount.configDir`;
    * only `account === undefined` falls back to the default account. When a config dir
-   * resolves, it is set as `AGY_HOME` (undocumented for `agy`, hence the note).
+   * resolves, it is set as `AGY_HOME` — which agy 1.3.5 does not read, hence the note.
    */
   private childEnv(account?: unknown): { env: Record<string, string | undefined>; note?: string } {
     // A null/malformed account is ABSENT (falls back to defaultAccount); a real account

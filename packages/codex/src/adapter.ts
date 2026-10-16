@@ -25,7 +25,14 @@ import {
 } from '@toragonite/agent-mesh';
 import { nodeExec, type ExecFn } from './exec.js';
 import { parseCodexEvents } from './parse.js';
-import { gateModels, gateModel } from './models.js';
+import {
+  DEFAULT_LIVE_MODELS_TIMEOUT_MS,
+  STATIC_MODELS,
+  cloneModel,
+  fetchLiveModels,
+  gateList,
+  gateModel,
+} from './models.js';
 import { resolveAuthStatus, resolveCodexHome, type ReadTextFile } from './auth.js';
 import { readQuota } from './quota.js';
 
@@ -51,11 +58,25 @@ export interface CodexAdapterOptions {
    * seams — present so auth/quota/env-merge are fully hermetic in tests.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Deadline for the `codex app-server` model listing behind `availableModels()`, in
+   * ms (default 15000). The app-server must answer AND exit by itself within it, or
+   * its process group is killed and the static list is returned.
+   */
+  modelsTimeoutMs?: number;
+  /**
+   * How long a FAILED listing keeps returning the static list before the CLI is asked
+   * again, in ms (default 60000), per account home. A successful listing is memoized
+   * per account home for the life of the instance. Either way a routing decision
+   * never spawns a process on every call.
+   */
+  modelsCacheMs?: number;
 }
 
 const VENDOR: Vendor = 'codex';
 const STDERR_CAP = 4096;
 const DEFAULT_QUOTA_TIMEOUT_MS = 10_000;
+const DEFAULT_MODELS_CACHE_MS = 60_000;
 
 /** Default file reader: contents as utf-8, or null on any read failure (e.g. ENOENT). */
 const defaultReadTextFile: ReadTextFile = async (path) => {
@@ -131,6 +152,15 @@ export class CodexAdapter implements Adapter {
   private readonly fetchFn: typeof fetch;
   private readonly quotaTimeoutMs: number;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly modelsTimeoutMs: number;
+  private readonly modelsCacheMs: number;
+
+  /** Successful live listings, per resolved CODEX_HOME (memoized for the instance's life). */
+  private readonly liveModels = new Map<string, ModelInfo[]>();
+  /** Per CODEX_HOME: epoch-ms until which a FAILED listing is not retried. */
+  private readonly liveFailedUntil = new Map<string, number>();
+  /** Per CODEX_HOME: the listing in flight, so concurrent calls share one app-server. */
+  private readonly liveInFlight = new Map<string, Promise<ModelInfo[] | undefined>>();
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.exec = opts.exec ?? nodeExec;
@@ -140,6 +170,8 @@ export class CodexAdapter implements Adapter {
     this.fetchFn = opts.fetchFn ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
     this.quotaTimeoutMs = opts.quotaTimeoutMs ?? DEFAULT_QUOTA_TIMEOUT_MS;
     this.env = opts.env ?? process.env;
+    this.modelsTimeoutMs = opts.modelsTimeoutMs ?? DEFAULT_LIVE_MODELS_TIMEOUT_MS;
+    this.modelsCacheMs = opts.modelsCacheMs ?? DEFAULT_MODELS_CACHE_MS;
   }
 
   async authStatus(account?: Account): Promise<AuthStatus> {
@@ -147,9 +179,49 @@ export class CodexAdapter implements Adapter {
     return resolveAuthStatus(this.env.OPENAI_API_KEY, home, this.readTextFile);
   }
 
+  /**
+   * The models this account can pick, as the CLI itself lists them (`codex
+   * app-server` → `model/list`, run with this account's CODEX_HOME), gated by auth
+   * mode exactly like the static catalog. When the CLI cannot answer — not
+   * installed, an error, a malformed answer, the deadline — the static catalog is
+   * returned instead. Never throws, never hangs (`modelsTimeoutMs` bounds the
+   * listing). A successful listing is memoized per CODEX_HOME; a failed one is
+   * retried after `modelsCacheMs`. Fresh arrays every call.
+   */
   async availableModels(account?: Account): Promise<ModelInfo[]> {
     const status = await this.authStatus(account);
-    return gateModels(status);
+    const home = resolveCodexHome(asAccount(account), this.defaultAccount, this.env);
+    const live = await this.liveModelsFor(home);
+    return gateList(live ?? STATIC_MODELS, status);
+  }
+
+  /** The memoized live listing for one CODEX_HOME, or undefined while it is unavailable. */
+  private async liveModelsFor(home: string): Promise<ModelInfo[] | undefined> {
+    const cached = this.liveModels.get(home);
+    if (cached) return cached.map(cloneModel);
+    if (Date.now() < (this.liveFailedUntil.get(home) ?? 0)) return undefined;
+    let pending = this.liveInFlight.get(home);
+    if (!pending) {
+      pending = fetchLiveModels({
+        binary: this.binary,
+        codexHome: home,
+        env: this.env,
+        timeoutMs: this.modelsTimeoutMs,
+      })
+        .then((models) => {
+          if (models.length > 0) {
+            this.liveModels.set(home, models);
+            return models;
+          }
+          this.liveFailedUntil.set(home, Date.now() + this.modelsCacheMs);
+          return undefined;
+        })
+        .catch(() => undefined) // fetchLiveModels never rejects; belt-and-braces
+        .finally(() => this.liveInFlight.delete(home));
+      this.liveInFlight.set(home, pending);
+    }
+    const models = await pending;
+    return models?.map(cloneModel);
   }
 
   async quota(account?: Account): Promise<QuotaSnapshot | null> {
