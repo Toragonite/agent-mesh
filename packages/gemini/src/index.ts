@@ -14,12 +14,18 @@ export {
   STATIC_MODELS,
   parseModelsOutput,
 } from './models.js';
+// Process seams, plus the 0.1.3 helpers: the leader-only interrupt ladder and a
+// run-to-completion over any line seam.
 export {
   nodeExec,
   nodeLineStream,
+  interruptLadder,
+  execOverLineStream,
   type ExecFn,
   type ExecRequest,
   type ExecResult,
   type LineStreamFn,
   type StreamEndMeta,
+  type SpawnedProcess,
+  type InterruptLadderStages,
 } from './exec.js';

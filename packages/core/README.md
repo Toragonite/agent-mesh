@@ -59,6 +59,43 @@ console.log(`[${result.vendor}] ${result.text}`);
 - **Data contract & errors** — `RunTask`, `RunResult`, `QuotaSnapshot`,
   `ModelInfo`, and the `AgentMeshError` hierarchy.
 
+## Turns that resume one conversation (since 0.1.3)
+
+A host can drive a coding agent as a series of headless **turns** — the first starts a
+conversation, every later one resumes it — with the same calls on every vendor. All of it is
+optional and additive; an adapter written against 0.1.2 still satisfies `Adapter`.
+
+```ts
+const events = adapter.stream(
+  {
+    prompt: 'Pick up where you left off.',
+    resumeId: conversationId,        // continue it (run() honours it too)
+    model: 'gpt-6-luna',             // passed again on every turn (Codex requires it on a resume)
+    permissionMode: 'workspace-write',
+    mcp: { name: 'team', command: '/usr/local/bin/node', args: ['/srv/team.js'], configFile: '/srv/team.json' },
+  },
+  { lineStream: mySeam, env: childEnv }, // RunOptions: the spawn seam and the WHOLE child env
+);
+for await (const ev of events) {
+  if (ev.type === 'session' && ev.conversationId !== conversationId) {
+    // The CLI continued in a NEW conversation (Cursor and Antigravity do this silently
+    // for an id they do not know) — re-brief it.
+  }
+}
+```
+
+- **`RunTask`** gains `resumeId`, `sessionId`, `appendSystemPromptFile`, `unattended`, `mcp`
+  (an `McpAttachment`), `disallowedTools`, `settingSources` and `elevated`. Each adapter maps
+  them to its CLI's own flags and notes (on `RunResult.note`) the ones its CLI has no
+  equivalent for; an invalid value throws before anything is spawned.
+- **`RunOptions`** — the optional second argument of `run()` / `stream()`: `lineStream` (every
+  process of the run is started through it), `env` (the complete child environment, used as
+  is — the adapter adds no account variable), `skipAuthCheck`.
+- **`RunEvent` `session`** — the conversation id as the vendor's own stream reported it, never
+  synthesized from `sessionId` or `resumeId`. A stream ends with exactly one `done` or `error`.
+- **`Adapter.interactiveResume?()`** — the command line that opens the vendor's interactive
+  terminal on a conversation (an `InteractiveResumeSpec`), or `undefined`.
+
 ## Adapter packages
 
 | Package | Vendor |

@@ -6,6 +6,13 @@
  * Introspection (`authStatus`/`availableModels`/`quota`) reads local state and the absorbed
  * live-usage probe. `steer` reuses the absorbed mesh gateway to wake a peer session by name.
  *
+ * Since 0.1.3, `run()` and `stream()` also drive the turn lane: a task may start a conversation
+ * under a chosen id (`sessionId` → `--session-id`) or continue one (`resumeId` → `--resume`),
+ * append a system-prompt file, attach one MCP server for the run, forbid tools, and run with
+ * nobody to answer a permission prompt. `stream()` reports the CLI's own session id as a
+ * `session` event, and `interactiveResume()` returns the terminal command that hands a
+ * conversation to a person.
+ *
  * Every side-effecting seam — process exec, line streaming, config-file reads, the usage
  * probe, the mesh gateway — is injectable through the constructor so the whole surface is
  * testable with no real CLI, no network, and no real home directory. The defaults are the
@@ -22,11 +29,14 @@ import {
   type Adapter,
   type AdapterCapabilities,
   type AuthStatus,
+  type InteractiveResumeSpec,
+  type McpAttachment,
   type ModelInfo,
   type QuotaSnapshot,
   type QuotaWindow,
   type ResumeOptions,
   type RunEvent,
+  type RunOptions,
   type RunResult,
   type RunTask,
   type TokenUsage,
@@ -34,7 +44,7 @@ import {
 } from '@toragonite/agent-mesh';
 import { findSession } from './agents';
 import type { ExecFn, ExecRequest, ExecResult, LineStreamFn, StreamEndMeta } from './exec';
-import { nodeExec, nodeLineStream } from './exec';
+import { execOverLineStream, nodeExec, nodeLineStream } from './exec';
 import type { MeshGateway } from './gateway';
 import { accountConfigFile } from './protocol';
 import { defaultWindowLabel, getLiveUsage, type LiveUsage } from './usage';
@@ -60,6 +70,25 @@ const MODELS: ModelInfo[] = [
   { id: 'claude-haiku-4-5', latencyClass: 'fast' },
   { id: 'claude-fable-5', latencyClass: 'slow' },
 ];
+
+/** `McpAttachment.name`: a lowercase identifier — it becomes part of tool names (`mcp__<name>__<tool>`). */
+const MCP_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+
+/** A UUID, which `--session-id` requires (any case; passed through as given, trimmed). */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** C0 control characters and DEL — never part of a path or a value handed to the CLI. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/** The note for an explicit account whose config dir `options.env` displaces. */
+const ENV_ACCOUNT_NOTE = 'account.configDir not applied: options.env is the complete child environment';
+
+/**
+ * Whether the take-over command of {@link ClaudeAdapter.interactiveResume} has been verified
+ * against the real CLI (a person continues the conversation in `claude --resume <id>`, and the
+ * next headless `--resume` sees that person's turn). Not yet: it is reported as unverified.
+ */
+const INTERACTIVE_RESUME_VERIFIED = false;
 
 /**
  * True when `model` is in the static catalog, allowing a dated suffix (a catalog id is a prefix
@@ -203,6 +232,155 @@ function effectiveModel(model: string | undefined): string | undefined {
   return m ? m : undefined;
 }
 
+/* ------------------------------------------------------------------------- *
+ * The turn-lane fields of a task (0.1.3) — validated BEFORE anything spawns.
+ * ------------------------------------------------------------------------- */
+
+/** The 0.1.3 turn-lane fields of a task, validated and normalized. */
+interface TurnFields {
+  resumeId?: string;
+  sessionId?: string;
+  appendSystemPromptFile?: string;
+  unattended: boolean;
+  mcp?: McpAttachment;
+  disallowedTools: string[];
+  settingSources?: string;
+  /** Notes for fields this adapter dropped or ignored. */
+  notes: string[];
+}
+
+/** A conversation id field: trimmed; blank or `-`-leading throws. `undefined` stays absent. */
+function conversationIdField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  if (id === '') {
+    throw new AgentMeshError(`claude ${field} must be a non-empty conversation id`, VENDOR);
+  }
+  if (id.startsWith('-')) {
+    throw new AgentMeshError(`claude ${field} must not start with "-" (would parse as a CLI flag)`, VENDOR);
+  }
+  return id;
+}
+
+/** An absolute-path field (no control characters). `undefined` stays absent; anything else throws. */
+function absolutePathField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== 'string' || !path.isAbsolute(raw) || CONTROL_CHARS.test(raw)) {
+    throw new AgentMeshError(`claude ${field} must be an absolute path`, VENDOR);
+  }
+  return raw;
+}
+
+/** Validate an {@link McpAttachment}: every field is checked by value; a bad one throws. */
+function mcpField(raw: unknown): McpAttachment {
+  if (!isRecord(raw)) {
+    throw new AgentMeshError('claude mcp must be an object { name, command, args, configFile }', VENDOR);
+  }
+  const { name, command, args } = raw;
+  if (typeof name !== 'string' || !MCP_NAME.test(name)) {
+    throw new AgentMeshError('claude mcp.name must match /^[a-z][a-z0-9_]{0,31}$/', VENDOR);
+  }
+  if (typeof command !== 'string' || command.trim() === '' || CONTROL_CHARS.test(command)) {
+    throw new AgentMeshError('claude mcp.command must be a non-empty string without control characters', VENDOR);
+  }
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && !CONTROL_CHARS.test(a))) {
+    throw new AgentMeshError('claude mcp.args must be an array of strings without control characters', VENDOR);
+  }
+  const configFile = absolutePathField(raw.configFile, 'mcp.configFile');
+  if (configFile === undefined) {
+    throw new AgentMeshError('claude mcp.configFile must be an absolute path', VENDOR);
+  }
+  const projectConfigFile = absolutePathField(raw.projectConfigFile, 'mcp.projectConfigFile');
+  return {
+    name,
+    command,
+    args: args.map((a) => String(a)),
+    configFile,
+    ...(projectConfigFile !== undefined ? { projectConfigFile } : {}),
+  };
+}
+
+/** A tool-name list: must be an array; non-string or blank entries are dropped and counted. */
+function toolListField(raw: unknown, field: string): { tools: string[]; dropped: number } {
+  if (raw === undefined) {
+    return { tools: [], dropped: 0 };
+  }
+  if (!Array.isArray(raw)) {
+    throw new AgentMeshError(`claude ${field} must be an array of tool names`, VENDOR);
+  }
+  const tools = raw
+    .filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+    .map((t) => t.trim());
+  return { tools, dropped: raw.length - tools.length };
+}
+
+/** `settingSources`: blank is absent (U2); a flag-shaped or non-string value throws. */
+function settingSourcesField(raw: unknown): string | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== 'string') {
+    throw new AgentMeshError('claude settingSources must be a string such as "user,project"', VENDOR);
+  }
+  const value = raw.trim();
+  if (value === '') {
+    return undefined;
+  }
+  if (value.startsWith('-') || CONTROL_CHARS.test(value)) {
+    throw new AgentMeshError('claude settingSources must be a value such as "user,project", not a flag', VENDOR);
+  }
+  return value;
+}
+
+/** Validate every turn-lane field of `task`. Throws AgentMeshError on the first invalid one. */
+function turnFields(task: RunTask): TurnFields {
+  const notes: string[] = [];
+  const resumeId = conversationIdField(task.resumeId, 'resumeId');
+  let sessionId: string | undefined;
+  if (task.sessionId !== undefined) {
+    const candidate = typeof task.sessionId === 'string' ? task.sessionId.trim() : '';
+    if (!UUID.test(candidate)) {
+      throw new AgentMeshError('claude sessionId must be a UUID (claude --session-id takes one)', VENDOR);
+    }
+    sessionId = candidate;
+  }
+  if (resumeId !== undefined && sessionId !== undefined) {
+    throw new AgentMeshError(
+      'claude sessionId and resumeId are mutually exclusive: sessionId starts a conversation, resumeId continues one',
+      VENDOR,
+    );
+  }
+  const appendSystemPromptFile = absolutePathField(task.appendSystemPromptFile, 'appendSystemPromptFile');
+  const mcp = task.mcp === undefined ? undefined : mcpField(task.mcp);
+  const { tools: disallowedTools, dropped } = toolListField(task.disallowedTools, 'disallowedTools');
+  if (dropped > 0) {
+    notes.push(`disallowedTools contained ${dropped} non-string or blank ${dropped === 1 ? 'entry' : 'entries'}; dropped`);
+  }
+  const settingSources = settingSourcesField(task.settingSources);
+  if (task.elevated === true) {
+    notes.push('elevated has no claude equivalent; ignored');
+  }
+  return {
+    ...(resumeId !== undefined ? { resumeId } : {}),
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(appendSystemPromptFile !== undefined ? { appendSystemPromptFile } : {}),
+    unattended: task.unattended === true,
+    ...(mcp !== undefined ? { mcp } : {}),
+    disallowedTools,
+    ...(settingSources !== undefined ? { settingSources } : {}),
+    notes,
+  };
+}
+
+/** Lexically, do two directory strings name the same directory? No filesystem access. */
+function sameDir(a: string, b: string): boolean {
+  return path.resolve(a) === path.resolve(b);
+}
+
 export class ClaudeAdapter implements Adapter {
   readonly vendor: Vendor = VENDOR;
   readonly capabilities: AdapterCapabilities = {
@@ -328,11 +506,17 @@ export class ClaudeAdapter implements Adapter {
    * and `--allowedTools` (variadic) is fenced off from the prompt by the trailing `-p` flag.
    * A blank prompt throws before spawning; a spawn failure or a non-zero exit with no parseable
    * result throws AdapterExecError; a timeout resolves an `incomplete` result (never throws).
+   *
+   * Since 0.1.3: `task.resumeId` continues a conversation (`--resume <id>` with every other flag
+   * passed again), `task.sessionId` starts one under a chosen UUID, and the other turn-lane
+   * fields map as {@link stream} documents. `opts.lineStream` (when given) is the only seam the
+   * run spawns through; `opts.env` (when given) is the child's whole environment.
    */
-  async run(task: RunTask): Promise<RunResult> {
+  async run(task: RunTask, opts?: RunOptions): Promise<RunResult> {
     if (typeof task.prompt !== 'string' || task.prompt.trim() === '') {
       throw new AgentMeshError('claude run requires a non-empty prompt', VENDOR);
     }
+    const turn = turnFields(task);
     const model = effectiveModel(task.model);
     const args = this.buildArgs(
       {
@@ -340,18 +524,28 @@ export class ClaudeAdapter implements Adapter {
         permissionMode: task.permissionMode,
         allowedTools: task.allowedTools,
         extra: task.extra,
+        turn,
       },
       task.prompt,
       'json',
     );
-    const result = await this.exec1({
-      cmd: this.binary,
-      args,
-      cwd: task.cwd,
-      env: this.configEnv(task.account),
-      timeoutMs: task.timeoutMs,
-    });
-    return this.toRunResult(result, model, task.timeoutMs, extraArgsNote(task.extra));
+    const { env, note: envNote } = this.childEnv(task.account, opts);
+    const result = await this.exec1(
+      {
+        cmd: this.binary,
+        args,
+        cwd: task.cwd,
+        env,
+        timeoutMs: task.timeoutMs,
+      },
+      opts,
+    );
+    return this.toRunResult(
+      result,
+      model,
+      task.timeoutMs,
+      this.composeNote(extraArgsNote(task.extra), ...turn.notes, envNote),
+    );
   }
 
   /**
@@ -408,10 +602,23 @@ export class ClaudeAdapter implements Adapter {
   }
 
   /**
-   * Incremental events for a run over `--output-format stream-json --verbose`. Session id is
-   * remembered from init/system events; assistant text blocks become `text` events and
-   * `tool_use` blocks become `tool` events; the terminal `result` event emits a `usage` event
-   * then a `done` event carrying the mapped {@link RunResult}. Non-JSON lines are skipped.
+   * Incremental events for a run over `--output-format stream-json --verbose`. Assistant text
+   * blocks become `text` events and `tool_use` blocks become `tool` events; the terminal
+   * `result` event emits a `usage` event then a `done` event carrying the mapped
+   * {@link RunResult}. Non-JSON lines are skipped. The stream ends with exactly one `done` or
+   * `error`: lines after the terminal `result` are drained but emit nothing.
+   *
+   * Session (since 0.1.3): the first line that carries a `session_id` (normally `system/init`)
+   * emits a `session` event with that id — the CLI's own report, never `task.sessionId` or
+   * `task.resumeId` echoed back — and a later line with a DIFFERENT id emits another.
+   *
+   * Turn lane (since 0.1.3), in argv order: `resumeId` → `--resume <id>`, `sessionId` →
+   * `--session-id <uuid>`, `model` → `--model`, `permissionMode` → `--permission-mode` (on every
+   * run, resumed or not), `unattended` → `--permission-prompts none`, `settingSources` →
+   * `--setting-sources <v>`, `appendSystemPromptFile` → `--append-system-prompt-file <path>`,
+   * `mcp` → `--mcp-config [<projectConfigFile>] <configFile> --strict-mcp-config`, `allowedTools`
+   * → `--allowedTools a,b`, `disallowedTools` → `--disallowedTools a,b`, then `extra.args`, then
+   * `-p --output-format stream-json --verbose -- <prompt>`. Measured on Claude Code 2.1.299.
    *
    * Failure fidelity mirrors {@link run} (M2): if the stream ends with no `result` event, a
    * TIMEOUT emits a `done` with `status:'incomplete'` and a timeout note (never an `error`),
@@ -419,51 +626,60 @@ export class ClaudeAdapter implements Adapter {
    * whose message includes the exit code and the child's stderr tail. A spawn-level failure
    * still emits a single `error`.
    *
-   * The empty-prompt guard runs EAGERLY at call time (N1): `stream()` is a plain method that
-   * validates and then returns the async generator, so a blank prompt throws before spawn —
-   * not deferred to the first `next()` as a bare `async *` would.
+   * Validation runs EAGERLY at call time (N1): `stream()` is a plain method that validates and
+   * then returns the async generator, so a blank prompt or an invalid turn-lane field throws
+   * before spawn — not deferred to the first `next()` as a bare `async *` would.
    */
-  stream(task: RunTask): AsyncGenerator<RunEvent> {
+  stream(task: RunTask, opts?: RunOptions): AsyncGenerator<RunEvent> {
     if (typeof task.prompt !== 'string' || task.prompt.trim() === '') {
       throw new AgentMeshError('claude run requires a non-empty prompt', VENDOR);
     }
-    return this.streamEvents(task);
+    const turn = turnFields(task);
+    return this.streamEvents(task, turn, opts);
   }
 
-  /** The generator behind {@link stream}; the prompt is already validated by the time this runs. */
-  private async *streamEvents(task: RunTask): AsyncGenerator<RunEvent> {
+  /** The generator behind {@link stream}; the task is already validated by the time this runs. */
+  private async *streamEvents(task: RunTask, turn: TurnFields, opts?: RunOptions): AsyncGenerator<RunEvent> {
     const model = effectiveModel(task.model);
     const modelNote = this.modelNote(model);
-    const extraNote = extraArgsNote(task.extra);
+    const { env, note: envNote } = this.childEnv(task.account, opts);
+    const extraNote = this.composeNote(extraArgsNote(task.extra), ...turn.notes, envNote);
     const args = this.buildArgs(
       {
         model,
         permissionMode: task.permissionMode,
         allowedTools: task.allowedTools,
         extra: task.extra,
+        turn,
       },
       task.prompt,
       'stream-json',
     );
+    // A per-run seam (RunOptions.lineStream) is the ONLY seam this run spawns through.
+    const lineStream: LineStreamFn = opts?.lineStream ?? this.lineStream;
 
     let sessionId = '';
+    let reportedSession = '';
     let seenModel: string | undefined;
     let textSoFar = '';
     let emittedDone = false;
     let endMeta: StreamEndMeta | undefined;
     try {
-      for await (const line of this.lineStream(
+      for await (const line of lineStream(
         {
           cmd: this.binary,
           args,
           cwd: task.cwd,
-          env: this.configEnv(task.account),
+          env,
           timeoutMs: task.timeoutMs,
         },
         (meta) => {
           endMeta = meta;
         },
       )) {
+        if (emittedDone) {
+          continue; // drain: nothing follows the terminal event
+        }
         const trimmed = line.trim();
         if (!trimmed) {
           continue;
@@ -480,6 +696,10 @@ export class ClaudeAdapter implements Adapter {
         const eventSession = str(event, 'session_id');
         if (eventSession) {
           sessionId = eventSession;
+          if (eventSession !== reportedSession) {
+            reportedSession = eventSession;
+            yield { type: 'session', conversationId: eventSession };
+          }
         }
         const eventModel = str(event, 'model');
         if (eventModel) {
@@ -523,7 +743,9 @@ export class ClaudeAdapter implements Adapter {
         }
       }
     } catch (e) {
-      yield { type: 'error', message: e instanceof Error ? e.message : String(e) };
+      if (!emittedDone) {
+        yield { type: 'error', message: e instanceof Error ? e.message : String(e) };
+      }
       return;
     }
     if (emittedDone) {
@@ -551,6 +773,37 @@ export class ClaudeAdapter implements Adapter {
     yield {
       type: 'error',
       message: `claude stream ended without a result event${codePart}${tail}`,
+    };
+  }
+
+  /**
+   * The command that opens Claude Code's INTERACTIVE terminal on `conversationId` — what a host
+   * runs in a PTY to hand a headless conversation to a person: `claude --resume <id>`. Nothing is
+   * spawned. `env` / `unsetEnv` carry the account's config-dir binding: the host's own
+   * `CLAUDE_CONFIG_DIR` string when the account IS the host's directory; otherwise the default
+   * directory (`~/.claude`) is expressed by UNSETTING `CLAUDE_CONFIG_DIR` — an explicit default
+   * path makes the CLI read a different credential and look logged out — and any other directory
+   * is set verbatim. A fully ambient account unsets it too. `verified` is `false`: this take-over
+   * has not been verified against the real CLI yet. A blank or `-`-leading id throws.
+   */
+  interactiveResume(conversationId: string, account?: Account): InteractiveResumeSpec {
+    const id = typeof conversationId === 'string' ? conversationId.trim() : '';
+    if (id === '') {
+      throw new AgentMeshError('claude interactiveResume requires a non-empty conversationId', VENDOR);
+    }
+    if (id.startsWith('-')) {
+      throw new AgentMeshError(
+        'claude interactiveResume conversationId must not start with "-" (would parse as a CLI flag)',
+        VENDOR,
+      );
+    }
+    const binding = this.configDirBinding(account);
+    return {
+      command: this.binary,
+      args: ['--resume', id],
+      env: binding.set !== undefined ? { CLAUDE_CONFIG_DIR: binding.set } : {},
+      unsetEnv: binding.set !== undefined ? [] : ['CLAUDE_CONFIG_DIR'],
+      verified: INTERACTIVE_RESUME_VERIFIED,
     };
   }
 
@@ -596,6 +849,36 @@ export class ClaudeAdapter implements Adapter {
   }
 
   /**
+   * How `CLAUDE_CONFIG_DIR` must be presented to a terminal that should run as the account:
+   * `{ set }` to export exactly that string, `{}` (no `set`) for "must be absent". Rules, in order:
+   * the host's own non-blank `CLAUDE_CONFIG_DIR` naming the same directory → that string,
+   * untouched; no directory at all (ambient) or the default `~/.claude` → absent; anything else →
+   * the directory verbatim. Directories are compared lexically (`path.resolve`).
+   */
+  private configDirBinding(account?: Account): { set?: string } {
+    const hostRaw = this.env.CLAUDE_CONFIG_DIR;
+    const host = typeof hostRaw === 'string' && hostRaw.trim() !== '' ? hostRaw : undefined;
+    let dir: string | undefined;
+    if (isRecord(account)) {
+      dir = typeof account.configDir === 'string' && account.configDir.trim() !== '' ? account.configDir : undefined;
+    } else {
+      const fallback = this.defaultAccount?.configDir;
+      dir = typeof fallback === 'string' && fallback.trim() !== '' ? fallback : undefined;
+    }
+    dir = dir ?? host;
+    if (dir === undefined) {
+      return {};
+    }
+    if (host !== undefined && sameDir(host, dir)) {
+      return { set: host };
+    }
+    if (sameDir(dir, path.join(os.homedir(), '.claude'))) {
+      return {};
+    }
+    return { set: dir };
+  }
+
+  /**
    * The FULLY RESOLVED child env for a spawn: the injected `env` seam (default `process.env`) as
    * the base, with `CLAUDE_CONFIG_DIR` overlaid ONLY when this call resolves an explicit config
    * dir. The exec seam treats this as the complete child env (no merge over `process.env`), so an
@@ -607,6 +890,24 @@ export class ClaudeAdapter implements Adapter {
   private configEnv(account?: Account): Record<string, string | undefined> {
     const configDir = this.resolveConfigDir(account);
     return { ...this.env, ...(configDir !== undefined ? { CLAUDE_CONFIG_DIR: configDir } : {}) };
+  }
+
+  /**
+   * The child env for a run()/stream() call. With `opts.env` (0.1.3) the caller's env is used
+   * VERBATIM — a copy, with no `CLAUDE_CONFIG_DIR` of the adapter's own and no fallback to the env
+   * seam's or the default account's directory (the caller composed the account's binding,
+   * including an UNSET variable for the default directory). An explicit `account.configDir` it
+   * displaces is noted. Without `opts.env`, {@link configEnv} applies exactly as before.
+   */
+  private childEnv(
+    account: Account | undefined,
+    opts: RunOptions | undefined,
+  ): { env: Record<string, string | undefined>; note?: string } {
+    if (opts?.env) {
+      const explicit = isRecord(account) && typeof account.configDir === 'string' && account.configDir !== '';
+      return { env: { ...opts.env }, ...(explicit ? { note: ENV_ACCOUNT_NOTE } : {}) };
+    }
+    return { env: this.configEnv(account) };
   }
 
   /** The catalog note for a requested model, or `undefined` when the model is known/absent (M12). */
@@ -621,15 +922,17 @@ export class ClaudeAdapter implements Adapter {
   }
 
   /**
-   * Build the argv shared by run/stream. Value flags come first (model, permission mode,
-   * allowed tools), then the caller's `extra.args` verbatim, then the output-format tail with
-   * the positional (prompt) ALWAYS last, fenced behind a `--` terminator. `stream-json` adds
-   * `--verbose`.
+   * Build the argv shared by run/stream. Conversation flags lead (`--resume` / `--session-id`),
+   * then value flags (model, permission mode, the turn-lane flags, allowed and disallowed tools),
+   * then the caller's `extra.args` verbatim, then the output-format tail with the positional
+   * (prompt) ALWAYS last, fenced behind a `--` terminator. `stream-json` adds `--verbose`. With
+   * no turn-lane field set, the argv is exactly what 0.1.2 produced.
    *
-   * `--allowedTools` is emitted as ONE comma-joined value (`--allowedTools Read,Edit`), never a
-   * variadic list, so a following `extra.args` token can never be swallowed into the tool grant
-   * (M6). The `--` before the prompt makes commander treat a flag-shaped prompt (`--help`, `-p`)
-   * as the positional, not a flag (H3).
+   * `--allowedTools` / `--disallowedTools` are emitted as ONE comma-joined value each
+   * (`--allowedTools Read,Edit`), never a variadic list, so a following `extra.args` token can
+   * never be swallowed into the tool grant (M6). `--mcp-config` is variadic too; the files are
+   * closed by `--strict-mcp-config` right after them. The `--` before the prompt makes commander
+   * treat a flag-shaped prompt (`--help`, `-p`) as the positional, not a flag (H3).
    */
   private buildArgs(
     opts: {
@@ -637,29 +940,48 @@ export class ClaudeAdapter implements Adapter {
       permissionMode?: string;
       allowedTools?: string[];
       extra?: Record<string, unknown>;
+      turn: TurnFields;
     },
     positional: string,
     format: 'json' | 'stream-json',
   ): string[] {
+    const turn = opts.turn;
     const tail =
       format === 'stream-json'
         ? ['-p', '--output-format', 'stream-json', '--verbose', '--', positional]
         : ['-p', '--output-format', 'json', '--', positional];
     return [
+      ...(turn.resumeId ? ['--resume', turn.resumeId] : []),
+      ...(turn.sessionId ? ['--session-id', turn.sessionId] : []),
       ...(opts.model ? ['--model', opts.model] : []),
       ...(opts.permissionMode ? ['--permission-mode', opts.permissionMode] : []),
+      ...(turn.unattended ? ['--permission-prompts', 'none'] : []),
+      ...(turn.settingSources ? ['--setting-sources', turn.settingSources] : []),
+      ...(turn.appendSystemPromptFile ? ['--append-system-prompt-file', turn.appendSystemPromptFile] : []),
+      ...(turn.mcp
+        ? [
+            '--mcp-config',
+            ...(turn.mcp.projectConfigFile ? [turn.mcp.projectConfigFile] : []),
+            turn.mcp.configFile,
+            '--strict-mcp-config',
+          ]
+        : []),
       ...(opts.allowedTools && opts.allowedTools.length > 0
         ? ['--allowedTools', opts.allowedTools.join(',')]
         : []),
+      ...(turn.disallowedTools.length > 0 ? ['--disallowedTools', turn.disallowedTools.join(',')] : []),
       ...extraArgs(opts.extra),
       ...tail,
     ];
   }
 
-  /** Run the exec seam, converting a spawn-level rejection (ENOENT, spawn throw) to AdapterExecError. */
-  private async exec1(req: ExecRequest): Promise<ExecResult> {
+  /**
+   * Run the exec seam — or, when `opts.lineStream` is given, that per-run seam (drained to
+   * completion) — converting a spawn-level rejection (ENOENT, spawn throw) to AdapterExecError.
+   */
+  private async exec1(req: ExecRequest, opts?: RunOptions): Promise<ExecResult> {
     try {
-      return await this.exec(req);
+      return opts?.lineStream ? await execOverLineStream(opts.lineStream, req) : await this.exec(req);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       throw new AdapterExecError(`claude failed to spawn: ${message}`, VENDOR, {

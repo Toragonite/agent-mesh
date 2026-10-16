@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.3
+
+The turn lane. Measured on cursor-agent 2026.10.14.
+
+- **`resumeId` → `--resume <id>`** on `run()` and `stream()`. For a first turn, mint the id with
+  `createChat()` and pass it as `resumeId` — `sessionId` is not a cursor-agent flag and is ignored
+  with a note. `--sandbox` is passed on every turn, as before. `createChat()` takes `cwd` and
+  `env` options, so the chat can be minted where (and as) its turns will run.
+- **`mcp` → `--approve-mcps`**; the caller writes `<cwd>/.cursor/mcp.json`. **`elevated: true` →
+  `--force`**, the only way this adapter ever passes it.
+- **`session` event** from the CLI's `session_id`, once (again only if it changes). For a
+  well-formed but unknown chat id cursor-agent SILENTLY starts a new chat: the `session` id then
+  differs from `resumeId`. With no id reported, the result falls back to `resumeId`, as `resume()`
+  does.
+- **One terminal event:** lines after `result` are drained but emit nothing; no `error` after `done`.
+- **`RunOptions`:** `lineStream` is the only seam the run spawns through; `env` is the child's whole
+  environment, used verbatim.
+- `appendSystemPromptFile`: no cursor-agent flag — the content is prefixed to the prompt, with a note.
+  `disallowedTools`, `settingSources` and `mcp.projectConfigFile` are ignored with a note;
+  `unattended` needs nothing. Invalid turn-lane fields throw before anything is spawned.
+- `interactiveResume()` returns `undefined` (no interactive take-over in this release).
+- **Process seam:** `ExecRequest.onSpawn` / `SpawnedProcess`, `interruptLadder()` and
+  `execOverLineStream()`, exported from the entry.
+
+All five packages move in lockstep (0.1.2 was never published to npm); this package now depends on
+`@toragonite/agent-mesh@^0.1.3`.
+
 ## 0.1.2
 
 `quota()` now reports Cursor plan usage (it was a stub returning `null`), and

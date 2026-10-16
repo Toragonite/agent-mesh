@@ -1,6 +1,6 @@
 {
   "name": "@toragonite/agent-mesh-cursor",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Cursor adapter for agent-mesh — drive the official cursor-agent CLI headlessly: run, resume, stream, live model catalog, auth. Unofficial.",
   "keywords": ["ai","agent","orchestration","cursor","cursor-agent","llm","cli","agent-mesh"],
   "license": "MIT",
@@ -29,6 +29,6 @@
     "prepublishOnly": "tsup"
   },
   "dependencies": {
-    "@toragonite/agent-mesh": "^0.1.0"
+    "@toragonite/agent-mesh": "^0.1.3"
   }
 }

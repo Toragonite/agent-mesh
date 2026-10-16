@@ -3,6 +3,39 @@
 All notable changes to **@toragonite/agent-mesh** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.3
+
+Additive: what a host needs to drive a coding agent as a series of headless **turns** that
+resume one conversation, on all four vendors. Every addition is optional; an adapter written
+against 0.1.2 still satisfies `Adapter`.
+
+- **`RunTask` turn-lane fields:** `resumeId` (continue a conversation — honoured by `run()` and
+  `stream()`), `sessionId` (start one under a chosen id where the CLI can; exclusive with
+  `resumeId`), `appendSystemPromptFile`, `unattended`, `mcp`, `disallowedTools`,
+  `settingSources`, `elevated`. Each adapter maps them to its CLI's own flags and notes the ones
+  its CLI has no equivalent for; an invalid value throws before anything is spawned.
+- **`McpAttachment`** — `{ name, command, args, configFile, projectConfigFile? }`: one stdio MCP
+  server attached to a single run.
+- **`RunOptions`** — the optional second argument of `run()` and `stream()`: `lineStream` (the
+  spawn seam every process of the run goes through), `env` (the complete child environment, used
+  as is; the adapter adds no account variable), `skipAuthCheck`.
+- **`SpawnRequest`, `StreamEndMeta`, `LineStreamFn`** — the line-seam types `RunOptions.lineStream`
+  uses; structurally the same as each adapter package's own `ExecRequest` / `StreamEndMeta` /
+  `LineStreamFn`.
+- **`RunEvent` `{ type: 'session', conversationId }`** — the conversation id as the vendor's own
+  stream reported it, never synthesized from `sessionId` / `resumeId`. A stream ends with exactly
+  one `done` or `error`. Note for consumers: an exhaustive `switch` over `RunEvent` sees one more
+  member, and a test that pins an exact event sequence now sees a `session` event wherever the CLI
+  reports an id.
+- **`Adapter.interactiveResume?(conversationId, account?)`** → `InteractiveResumeSpec | undefined`
+  (`{ command, args, env, unsetEnv?, verified }`): the command line that opens the vendor's
+  interactive terminal on a conversation. Nothing is spawned.
+- `Adapter.run()` and `Adapter.stream()` take the optional `opts?: RunOptions`.
+
+0.1.2 was never published to npm; its changes (below) ship in this release. All five packages
+move in lockstep, and the adapters now depend on `@toragonite/agent-mesh@^0.1.3`, because their
+type declarations use these types.
+
 ## 0.1.2
 
 One additive type change; no runtime changes.

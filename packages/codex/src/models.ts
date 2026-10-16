@@ -94,6 +94,15 @@ export function gateModel(modelId: string, status: AuthStatus): ModelGate {
   };
 }
 
+/**
+ * The catalog half of {@link gateModel}, with no login read: the "not in known catalog" note for
+ * an off-catalog id, else `undefined`. Used when the caller has already checked the account
+ * (`RunOptions.skipAuthCheck`), so the login-dependent `blocked` verdict is not computed.
+ */
+export function catalogNote(modelId: string): string | undefined {
+  return CATALOG.some((m) => m.id === modelId) ? undefined : `model ${modelId} not in known catalog`;
+}
+
 /* ------------------------------------------------------------------------- *
  * The live list — `codex app-server` `model/list`
  * ------------------------------------------------------------------------- */

@@ -62,7 +62,9 @@ describe('stream() over the captured payload (T14)', () => {
     expect(textEvents[0]!.text).toBe('RAW-A');
 
     const types = events.map((e) => e.type);
-    expect(types).toEqual(['text', 'usage', 'done']);
+    // 0.1.3: the conversation id agy reports on its init line comes first, once.
+    expect(types).toEqual(['session', 'text', 'usage', 'done']);
+    expect(events[0]).toEqual({ type: 'session', conversationId: '9a163f22' });
   });
 
   it('the done result equals what run() would produce for the same payload', async () => {

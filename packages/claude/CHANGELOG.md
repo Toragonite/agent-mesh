@@ -3,6 +3,48 @@
 All notable changes to **@toragonite/agent-mesh-claude** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3]
+
+The turn lane: `run()` and `stream()` start a conversation under a chosen id, continue one, and
+carry the flags a headless turn needs. Flags measured on Claude Code 2.1.299.
+
+- **New task fields → flags**, in argv order: `resumeId` → `--resume <id>`; `sessionId` →
+  `--session-id <uuid>` (a UUID; exclusive with `resumeId`); `unattended` →
+  `--permission-prompts none`; `settingSources` → `--setting-sources <v>`;
+  `appendSystemPromptFile` → `--append-system-prompt-file <absolute path>`; `mcp` →
+  `--mcp-config [<projectConfigFile>] <configFile> --strict-mcp-config`; `disallowedTools` →
+  `--disallowedTools a,b` (one comma-joined value, after `--allowedTools`). `model` and
+  `permissionMode` are passed on every run, resumed or not. `elevated` has no Claude equivalent
+  and is noted; non-string or blank `disallowedTools` entries are dropped with a note. A blank or
+  `-`-leading `resumeId`, a non-UUID `sessionId`, both ids together, a relative path, an invalid
+  `mcp`, a non-array `disallowedTools` or a flag-shaped `settingSources` throws `AgentMeshError`
+  before anything is spawned (`stream()`: at call time). With none of them set the argv is exactly
+  0.1.2's.
+- **`session` event:** `stream()` reports the CLI's own `session_id` (normally from
+  `system/init`, which 0.1.2 parsed but did not surface) once, and again only if a later line
+  reports a different id. Never synthesized from `sessionId` / `resumeId`.
+- **One terminal event:** lines after the `result` line are drained but emit nothing, and a seam
+  failure after `done` no longer adds an `error`.
+- **`RunOptions`:** `lineStream` is the only seam a run spawns through (`run()` drains it to
+  completion); `env` is the child's whole environment, used verbatim — no `CLAUDE_CONFIG_DIR` of
+  the adapter's own and no fallback to the `env` seam's or the default account's directory; an
+  explicit `account.configDir` it displaces is noted.
+- **`interactiveResume(id, account?)`:** `{ command: <binary>, args: ['--resume', id], env,
+  unsetEnv, verified: false }`. The config-dir binding: the host's own `CLAUDE_CONFIG_DIR` string
+  when it names the account's directory; the default `~/.claude`, or an ambient account, as an
+  UNSET `CLAUDE_CONFIG_DIR` (an explicit default path reads as logged out); any other directory
+  verbatim. Not yet verified against an interactive session, hence `verified: false`.
+- **Process seam:** `ExecRequest.onSpawn` reports the started child as a `SpawnedProcess` (`pid`,
+  `exited`, a leader-only `signal()`, a whole-group `signalGroup()`, `hasExited()`,
+  `lastOutputAt()`); `nodeExec` and `nodeLineStream` honour it. `interruptLadder(proc, stages?)`
+  sends SIGINT to the CLI process ONLY, then SIGTERM and SIGKILL to its process group (default
+  10 s / 5 s), and stops as soon as the process exits — a group SIGINT is never sent.
+  `execOverLineStream(lineStream, req)` runs a child to completion through any line seam.
+  `StreamEndMeta`, `SpawnedProcess` and `InterruptLadderStages` are exported from the entry.
+
+All five packages move in lockstep (0.1.2 was never published to npm); this package now depends on
+`@toragonite/agent-mesh@^0.1.3`.
+
 ## [0.1.2]
 
 No changes in this package — the published tarball is identical to 0.1.1 apart from the

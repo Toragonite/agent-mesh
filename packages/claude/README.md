@@ -58,6 +58,78 @@ always resolve the same account.
   working directory. Pass `resume(id, message, { extra: { cwd: '/path/to/repo' } })` to run the
   revision in the conversation's workspace.
 
+## Turns: start, resume, and hand over a conversation (since 0.1.3)
+
+`run()` and `stream()` take the turn-lane fields of `RunTask` and an optional `RunOptions`
+second argument. Flags as measured on Claude Code 2.1.299, in the order they are emitted:
+
+| Task field | Flag |
+| --- | --- |
+| `resumeId` | `--resume <id>` (continue the conversation; exclusive with `sessionId`) |
+| `sessionId` | `--session-id <uuid>` (start it under this id; must be a UUID) |
+| `model` | `--model <m>` — passed on every turn you give it |
+| `permissionMode` | `--permission-mode <mode>` — again on every turn, resumed or not |
+| `unattended` | `--permission-prompts none` (nobody can answer a prompt: it is denied) |
+| `settingSources` | `--setting-sources <v>` |
+| `appendSystemPromptFile` | `--append-system-prompt-file <absolute path>` (obeyed on resumed turns too) |
+| `mcp` | `--mcp-config [<projectConfigFile>] <configFile> --strict-mcp-config` |
+| `allowedTools` / `disallowedTools` | `--allowedTools a,b` / `--disallowedTools a,b` (one comma-joined value each) |
+
+then `extra.args`, then `-p --output-format stream-json --verbose -- <prompt>` (`json` for
+`run()`). `elevated` has no Claude equivalent and is noted. An invalid field (a blank or
+`-`-leading `resumeId`, a non-UUID `sessionId`, a relative path, an invalid `mcp`) throws
+`AgentMeshError` before anything is spawned — at call time for `stream()`.
+
+```ts
+const turn = claude.stream(
+  {
+    prompt: 'Next step.',
+    resumeId: sessionId,
+    permissionMode: 'acceptEdits',
+    unattended: true,
+    appendSystemPromptFile: '/srv/team/brief.md',
+    mcp: { name: 'team', command: process.execPath, args: ['/srv/team/server.js'], configFile: '/srv/team/mcp.json' },
+    allowedTools: ['mcp__team__inbox'],
+    disallowedTools: ['SendMessage'],
+  },
+  { lineStream: mySeam, env: childEnv },
+);
+```
+
+- **`session` event.** `stream()` reports the CLI's own `session_id` (normally from
+  `system/init`) as `{ type: 'session', conversationId }` — once, and again only if a later line
+  reports a different id. It is never synthesized from `sessionId` or `resumeId`. The stream ends
+  with exactly one `done` or `error`.
+- **`RunOptions.lineStream`** is the only seam the run spawns through (`run()` drains it to
+  completion). **`RunOptions.env`** is the child's whole environment, used verbatim: the adapter
+  sets no `CLAUDE_CONFIG_DIR` of its own and does not fall back to the `env` seam's or the
+  default account's directory — compose the account's binding yourself (for the default
+  `~/.claude`, leave `CLAUDE_CONFIG_DIR` unset). An explicit `account.configDir` it displaces is
+  noted.
+- **`interactiveResume(conversationId, account?)`** returns the command that opens the
+  interactive terminal on the conversation: `{ command: <binary>, args: ['--resume', id], env,
+  unsetEnv, verified: false }`. `env` / `unsetEnv` carry the config-dir binding: the host's own
+  `CLAUDE_CONFIG_DIR` string when it names the account's directory; the default `~/.claude` (or an
+  ambient account) as an UNSET `CLAUDE_CONFIG_DIR` — exporting the default path explicitly makes
+  the CLI look logged out; any other directory verbatim. Nothing is spawned. `verified` stays
+  `false` until this take-over is verified against an interactive session.
+- **Interrupting a turn.** `ExecRequest.onSpawn` hands you the started child as a
+  `SpawnedProcess`; `interruptLadder(proc)` sends SIGINT to the CLI process ONLY, then — if it
+  has not exited — SIGTERM and SIGKILL to its process group (10 s / 5 s by default, configurable).
+  A SIGINT to the whole group is never sent. `execOverLineStream(lineStream, req)` runs a child
+  to completion through any line seam.
+
+  ```ts
+  import { interruptLadder, nodeLineStream, type SpawnedProcess } from '@toragonite/agent-mesh-claude';
+
+  let proc: SpawnedProcess | undefined;
+  const events = claude.stream(task, {
+    lineStream: (req, onEnd) => nodeLineStream({ ...req, onSpawn: (p) => (proc = p) }, onEnd),
+  });
+  // later — stop the turn; the stream still ends with its done/error event:
+  if (proc) interruptLadder(proc, { termAfterMs: 10_000, killAfterMs: 5_000 });
+  ```
+
 ## License
 
 MIT © Toragonite

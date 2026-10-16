@@ -116,8 +116,9 @@ new CursorAdapter();                 // trust: true  → passes --trust (default
 new CursorAdapter({ trust: false }); // passes no --trust; a refusal is surfaced
 ```
 
-`--force` / `--yolo` is a **different and stronger** grant ("run everything").
-This adapter **never** passes it and does not expose it as a default. When
+`--force` / `--yolo` is a **different and stronger** grant ("force allow commands
+unless explicitly denied"). This adapter passes it **only** for a task that sets
+`elevated: true` (since 0.1.3) and never as a default. When
 `trust: false` and the CLI refuses, `run()` throws an `AdapterExecError` naming
 the `cwd` and pointing you at `{ trust: true }` (or trusting the directory in
 Cursor); `stream()` surfaces the same as an `error` event.
@@ -296,6 +297,38 @@ import { createChat } from '@toragonite/agent-mesh-cursor';
 const chatId = await createChat();
 if (chatId) await cursor.resume(chatId, 'first message');
 ```
+
+## Turns: resume, MCP, `--force` (since 0.1.3)
+
+`run()` and `stream()` take the turn-lane fields of `RunTask` and an optional `RunOptions`
+second argument. Measured on cursor-agent 2026.10.14, the argv is:
+
+```
+-p --output-format stream-json --stream-partial-output [--trust] [--approve-mcps]
+   [--resume <id>] [--model <m>] [--sandbox <mode>] [--force] [extra.args] -- <prompt>
+```
+
+- **`resumeId`** → `--resume <id>`. For the FIRST turn, mint the id with `createChat()` and
+  pass it as `resumeId` (`sessionId` is not a cursor-agent flag; it is ignored with a note).
+  `createChat({ cwd, env })` mints it in the directory, and with the environment, its turns will
+  use. `--sandbox` is passed again on every turn.
+- **`mcp`** → `--approve-mcps`. The servers come from the `.cursor/mcp.json` YOU write in the
+  run's `cwd` (Claude-style `{"mcpServers":{…}}`); the adapter writes no file.
+- **`elevated: true`** → `--force`, the only way this adapter ever passes it.
+- **`session` event.** `stream()` reports the CLI's own `session_id` once (again only if it
+  changes). For a well-formed but **unknown** chat id, cursor-agent **silently starts a new
+  chat** (a non-UUID id is an error instead): the `session` id then differs from `resumeId` —
+  compare the two after every resumed turn. When the CLI reports no id at all, the result falls
+  back to `resumeId`, as `resume()` does. The stream ends with exactly one `done` or `error`.
+- **`appendSystemPromptFile`** — no cursor-agent flag: the file's content is prefixed to the
+  prompt, with a note. `disallowedTools`, `settingSources` and `mcp.projectConfigFile` are
+  ignored with a note; `unattended` needs nothing (print mode never waits for an answer).
+- **`RunOptions`** — `lineStream` is the only seam the run spawns through; `env` is the child's
+  whole environment, used verbatim.
+- `interactiveResume()` returns `undefined`: no interactive take-over in this release.
+- The process seam exports `interruptLadder(proc)` (SIGINT to the CLI process only, then
+  SIGTERM and SIGKILL to its process group) for the `SpawnedProcess` that `ExecRequest.onSpawn`
+  reports, and `execOverLineStream(lineStream, req)`.
 
 ## Caveats
 

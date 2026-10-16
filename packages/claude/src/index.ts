@@ -14,9 +14,18 @@
 export { ClaudeAdapter } from './adapter';
 export type { ClaudeAdapterOptions } from './adapter';
 
-// Process seams (duplicated-by-design across adapters).
-export type { ExecRequest, ExecResult, ExecFn, LineStreamFn } from './exec';
-export { nodeExec, nodeLineStream } from './exec';
+// Process seams (duplicated-by-design across adapters), plus the 0.1.3 helpers: the
+// leader-only interrupt ladder and a run-to-completion over any line seam.
+export type {
+  ExecRequest,
+  ExecResult,
+  ExecFn,
+  LineStreamFn,
+  StreamEndMeta,
+  SpawnedProcess,
+  InterruptLadderStages,
+} from './exec';
+export { nodeExec, nodeLineStream, interruptLadder, execOverLineStream } from './exec';
 
 // Live claude.ai plan rate-limit usage reader (absorbed from claude-plan-usage).
 export type {

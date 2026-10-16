@@ -606,14 +606,17 @@ describe('stream() event mapping', () => {
       for (const l of lines) yield l;
     };
     const events = await collect(lineStream);
-    expect(events.slice(0, 4)).toEqual([
+    // 0.1.3: the CLI's own session id (system/init) is reported first, once.
+    expect(events[0]).toEqual({ type: 'session', conversationId: 'sess-77' });
+    expect(events.slice(1, 5)).toEqual([
       { type: 'text', text: 'Hello' },
       { type: 'tool', name: 'Read', detail: { path: 'a.ts' } },
       { type: 'text', text: ' world' },
       // totalTokens computed from input+output (U3).
       { type: 'usage', usage: { inputTokens: 4, outputTokens: 2, cachedInputTokens: 1, totalTokens: 6 } },
     ]);
-    const done = events[4];
+    expect(events).toHaveLength(6);
+    const done = events[5];
     expect(done!.type).toBe('done');
     expect((done as Extract<RunEvent, { type: 'done' }>).result).toMatchObject({
       vendor: 'claude',

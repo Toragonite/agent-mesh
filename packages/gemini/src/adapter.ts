@@ -9,12 +9,20 @@
  * there is no readable local auth file and no status/login subcommand. Usage comes
  * from agy itself: `agy -p /usage --output-format json` (see quota.ts).
  *
- * Every side-effecting seam (process exec, line streaming, env) is injectable
+ * Since 0.1.3 `run()` and `stream()` also drive the turn lane: `resumeId` →
+ * `--conversation <id>` (agy SILENTLY starts a new conversation for an id it does not
+ * know — the `session` event of a resumed `stream()` is how a caller notices), and
+ * `elevated` → `--dangerously-skip-permissions`, the only flag under which agy print mode
+ * calls MCP tools at all (the caller writes `<cwd>/.agents/mcp_config.json`).
+ *
+ * Every side-effecting seam (process exec, line streaming, env, file reads) is injectable
  * through the constructor with a real default, so the whole adapter is testable
  * with no real CLI, no network, and no real home directory. No token or secret
  * value ever appears in a result, note, detail, error, or raw payload — there are
  * no tokens on this path, but the rule holds regardless.
  */
+import { readFile } from 'node:fs/promises';
+import * as path from 'node:path';
 import {
   AdapterExecError,
   AgentMeshError,
@@ -22,15 +30,26 @@ import {
   type Adapter,
   type AdapterCapabilities,
   type AuthStatus,
+  type McpAttachment,
   type ModelInfo,
   type QuotaSnapshot,
   type ResumeOptions,
   type RunEvent,
+  type RunOptions,
   type RunResult,
   type RunTask,
   type Vendor,
 } from '@toragonite/agent-mesh';
-import { nodeExec, nodeLineStream, type ExecFn, type LineStreamFn, type StreamEndMeta } from './exec.js';
+import {
+  execOverLineStream,
+  nodeExec,
+  nodeLineStream,
+  type ExecFn,
+  type ExecRequest,
+  type ExecResult,
+  type LineStreamFn,
+  type StreamEndMeta,
+} from './exec.js';
 import { isRecord, mapPayload, pickLastJsonObject, type MappedPayload } from './parse.js';
 import { isKnownModel, parseModelsOutput, staticModels } from './models.js';
 import { DEFAULT_QUOTA_CACHE_MS, DEFAULT_QUOTA_TIMEOUT_MS, readAgyUsage } from './quota.js';
@@ -59,6 +78,18 @@ const ALLOWED_TOOLS_NOTE = 'allowedTools not supported by agy; ignored';
  */
 const AGY_HOME_NOTE =
   'account.configDir is passed as AGY_HOME, which agy 1.3.5 does not read; Antigravity account isolation is not provided: every account uses the default agy login';
+/** The note for an explicit account whose config dir `options.env` displaces. */
+const ENV_ACCOUNT_NOTE = 'account.configDir not applied: options.env is the complete child environment';
+/** agy 1.3.6 print mode calls MCP tools only under --dangerously-skip-permissions. */
+const MCP_NEEDS_ELEVATED_NOTE =
+  'mcp: agy print mode calls MCP tools only with elevated (--dangerously-skip-permissions); without it the tools are not called';
+
+/** `McpAttachment.name`: a lowercase identifier. */
+const MCP_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+/** C0 control characters and DEL — never part of a path or a value handed to the CLI. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** The largest `appendSystemPromptFile` whose content is prefixed to a prompt. */
+const APPEND_PROMPT_MAX_BYTES = 256 * 1024;
 
 export interface GeminiAdapterOptions {
   /** Run-to-completion process seam. Default: {@link nodeExec}. */
@@ -92,6 +123,20 @@ export interface GeminiAdapterOptions {
    * per account is in flight per adapter instance: a concurrent caller awaits it.
    */
   quotaCacheMs?: number;
+  /**
+   * Since 0.1.3: reads a text file (the `appendSystemPromptFile` of a task), resolving
+   * `null` when it is absent or unreadable. Default: an fs read.
+   */
+  readTextFile?: (path: string) => Promise<string | null>;
+}
+
+/** Default file reader: contents as utf-8, or null on any read failure (e.g. ENOENT). */
+async function defaultReadTextFile(file: string): Promise<string | null> {
+  try {
+    return await readFile(file, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 /** A positive finite timeout (capped to what a Node timer honours), else the default. */
@@ -168,6 +213,123 @@ function splitTrailingNewline(s: string): [string, string] {
   return [s, ''];
 }
 
+/* ------------------------------------------------------------------------- *
+ * The turn-lane fields of a task (0.1.3) — validated BEFORE anything spawns.
+ * ------------------------------------------------------------------------- */
+
+/** The validated turn-lane plan of one run()/stream() call. */
+interface TurnPlan {
+  /** Continue this conversation (`--conversation <id>`). */
+  resumeId?: string;
+  mcp?: McpAttachment;
+  appendSystemPromptFile?: string;
+  /** Pass `--dangerously-skip-permissions`. */
+  elevated: boolean;
+  /** Notes for the fields this adapter ignores, in their stable order. */
+  notes: string[];
+}
+
+/** A conversation id field: trimmed; blank or `-`-leading throws. `undefined` stays absent. */
+function conversationIdField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  if (id === '') {
+    throw new AgentMeshError(`agy ${field} must be a non-empty conversation id`, VENDOR);
+  }
+  if (id.startsWith('-')) {
+    throw new AgentMeshError(`agy ${field} must not start with "-" (would parse as a CLI flag)`, VENDOR);
+  }
+  return id;
+}
+
+/** An absolute-path field (no control characters). `undefined` stays absent; anything else throws. */
+function absolutePathField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !path.isAbsolute(raw) || CONTROL_CHARS.test(raw)) {
+    throw new AgentMeshError(`agy ${field} must be an absolute path`, VENDOR);
+  }
+  return raw;
+}
+
+/** Validate an {@link McpAttachment}: every field is checked by value; a bad one throws. */
+function mcpField(raw: unknown): McpAttachment {
+  if (!isRecord(raw)) {
+    throw new AgentMeshError('agy mcp must be an object { name, command, args, configFile }', VENDOR);
+  }
+  const { name, command, args } = raw;
+  if (typeof name !== 'string' || !MCP_NAME.test(name)) {
+    throw new AgentMeshError('agy mcp.name must match /^[a-z][a-z0-9_]{0,31}$/', VENDOR);
+  }
+  if (typeof command !== 'string' || command.trim() === '' || CONTROL_CHARS.test(command)) {
+    throw new AgentMeshError('agy mcp.command must be a non-empty string without control characters', VENDOR);
+  }
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && !CONTROL_CHARS.test(a))) {
+    throw new AgentMeshError('agy mcp.args must be an array of strings without control characters', VENDOR);
+  }
+  const configFile = absolutePathField(raw.configFile, 'mcp.configFile');
+  if (configFile === undefined) {
+    throw new AgentMeshError('agy mcp.configFile must be an absolute path', VENDOR);
+  }
+  const projectConfigFile = absolutePathField(raw.projectConfigFile, 'mcp.projectConfigFile');
+  return {
+    name,
+    command,
+    args: args.map((a) => String(a)),
+    configFile,
+    ...(projectConfigFile !== undefined ? { projectConfigFile } : {}),
+  };
+}
+
+/** A tool-name list field: must be an array when present; returns whether it names any tool. */
+function namesAnyTool(raw: unknown, field: string): boolean {
+  if (raw === undefined) return false;
+  if (!Array.isArray(raw)) {
+    throw new AgentMeshError(`agy ${field} must be an array of tool names`, VENDOR);
+  }
+  return raw.some((t) => typeof t === 'string' && t.trim() !== '');
+}
+
+/**
+ * Validate the turn-lane fields of `task` (synchronously — so `stream()` throws at call time).
+ * Throws AgentMeshError for: a blank or flag-shaped `resumeId`; `resumeId` together with
+ * `sessionId`; a relative `appendSystemPromptFile`; an invalid `mcp`; a non-array `disallowedTools`.
+ */
+function planTurn(task: RunTask): TurnPlan {
+  const notes: string[] = [];
+  const resumeId = conversationIdField(task.resumeId, 'resumeId');
+  if (task.sessionId !== undefined) {
+    if (resumeId !== undefined) {
+      throw new AgentMeshError(
+        'agy sessionId and resumeId are mutually exclusive: sessionId starts a conversation, resumeId continues one',
+        VENDOR,
+      );
+    }
+    notes.push('sessionId not supported by agy (the id comes from the init event); ignored');
+  }
+  const appendSystemPromptFile = absolutePathField(task.appendSystemPromptFile, 'appendSystemPromptFile');
+  const mcp = task.mcp === undefined ? undefined : mcpField(task.mcp);
+  const elevated = task.elevated === true;
+  if (mcp !== undefined && !elevated) {
+    notes.push(MCP_NEEDS_ELEVATED_NOTE);
+  }
+  if (namesAnyTool(task.disallowedTools, 'disallowedTools')) {
+    notes.push('disallowedTools not supported by agy; ignored');
+  }
+  if (isNonEmpty(task.settingSources)) {
+    notes.push('settingSources not supported by agy; ignored');
+  }
+  if (mcp?.projectConfigFile !== undefined) {
+    notes.push('mcp.projectConfigFile is not supported by agy; ignored');
+  }
+  return {
+    ...(resumeId !== undefined ? { resumeId } : {}),
+    ...(mcp !== undefined ? { mcp } : {}),
+    ...(appendSystemPromptFile !== undefined ? { appendSystemPromptFile } : {}),
+    elevated,
+    notes,
+  };
+}
+
 /** Everything execAndMap needs from a run()/resume() call, contract-neutral. */
 interface ExecContext {
   account?: Account;
@@ -178,9 +340,9 @@ interface ExecContext {
   /** Notes accumulated before spawn (allowedTools ignored, unknown model). */
   notes: string[];
   /**
-   * resume() ONLY: the trimmed conversation id the caller passed, used as a fallback
-   * when the payload echoes no non-empty id. run() leaves this unset so a genuinely
-   * empty id stays empty and the error path never fabricates one.
+   * resume() and a resumed run() ONLY: the trimmed conversation id the caller passed, used as
+   * a fallback when the payload echoes no non-empty id. A fresh run() leaves this unset so a
+   * genuinely empty id stays empty and the error path never fabricates one.
    */
   fallbackConversationId?: string;
 }
@@ -203,6 +365,7 @@ export class GeminiAdapter implements Adapter {
   private readonly authTimeoutMs: number;
   private readonly quotaTimeoutMs: number;
   private readonly quotaCacheMs: number;
+  private readonly readTextFile: (path: string) => Promise<string | null>;
 
   /** Per account key (see {@link quotaKey}): the last read's outcome and when it arrived. */
   private readonly quotaCache = new Map<string, { at: number; value: QuotaSnapshot | null }>();
@@ -224,6 +387,7 @@ export class GeminiAdapter implements Adapter {
     const cacheMs = opts.quotaCacheMs;
     this.quotaCacheMs =
       typeof cacheMs === 'number' && !Number.isNaN(cacheMs) && cacheMs >= 0 ? cacheMs : DEFAULT_QUOTA_CACHE_MS;
+    this.readTextFile = opts.readTextFile ?? defaultReadTextFile;
   }
 
   /* ----------------------------------------------------------------------- *
@@ -308,32 +472,43 @@ export class GeminiAdapter implements Adapter {
    * ----------------------------------------------------------------------- */
 
   /**
-   * Start a headless run. Argv order is fixed: `--output-format json`, then optional
-   * `--model` / `--mode`, then `extra.args` verbatim, then `-p` and the prompt ALWAYS
-   * last. There is no `--` fence — the prompt is the VALUE of `-p`, so a flag-shaped
-   * prompt round-trips as one argv element (verified live). A blank prompt throws
-   * before spawn; a timeout resolves `incomplete` (never throws); a spawn failure or
-   * a non-zero exit with no parseable payload throws AdapterExecError.
+   * Start a headless run. Argv order is fixed: `--conversation <id>` (with `resumeId`), then
+   * `--output-format json`, then optional `--model` / `--mode` / `--dangerously-skip-permissions`
+   * (ONLY with `elevated`), then `extra.args` verbatim, then `-p` and the prompt ALWAYS last.
+   * There is no `--` fence — the prompt is the VALUE of `-p`, so a flag-shaped prompt
+   * round-trips as one argv element (verified live). A blank prompt or an invalid turn-lane
+   * field throws before spawn; a timeout resolves `incomplete` (never throws); a spawn failure
+   * or a non-zero exit with no parseable payload throws AdapterExecError. `opts.lineStream`
+   * (since 0.1.3) is then the only seam the run spawns through, and `opts.env` the child's
+   * whole environment.
    */
-  async run(task: RunTask): Promise<RunResult> {
+  async run(task: RunTask, opts?: RunOptions): Promise<RunResult> {
     if (!isNonEmpty(task.prompt)) {
       throw new AgentMeshError('run: prompt must be a non-empty string', VENDOR);
     }
+    const plan = planTurn(task);
     const notes: string[] = [];
     if (task.allowedTools && task.allowedTools.length > 0) notes.push(ALLOWED_TOOLS_NOTE);
     const model = resolveModel(task.model);
     if (model && !isKnownModel(model)) notes.push(unknownModelNote(model));
     const extra = extraArgs(task.extra);
     if (extra.dropped > 0) notes.push(droppedArgsNote(extra.dropped));
+    notes.push(...plan.notes);
+    const prompt = await this.composePrompt(task.prompt, plan.appendSystemPromptFile, notes);
 
-    const args = this.buildRunArgs(task, 'json', model, extra.args);
-    return this.execAndMap(args, {
-      account: task.account,
-      cwd: task.cwd,
-      timeoutMs: task.timeoutMs,
-      modelOverride: model,
-      notes,
-    });
+    const args = this.buildRunArgs(task, 'json', model, extra.args, plan, prompt);
+    return this.execAndMap(
+      args,
+      {
+        account: task.account,
+        cwd: task.cwd,
+        timeoutMs: task.timeoutMs,
+        modelOverride: model,
+        notes,
+        ...(plan.resumeId !== undefined ? { fallbackConversationId: plan.resumeId } : {}),
+      },
+      opts,
+    );
   }
 
   /**
@@ -385,49 +560,80 @@ export class GeminiAdapter implements Adapter {
   }
 
   /**
-   * Incremental events over `--output-format stream-json`. The prompt is validated
-   * EAGERLY here (a plain method that throws, then returns the generator), so a blank
-   * prompt throws at call time — not deferred to the first `next()`.
+   * Incremental events over `--output-format stream-json`. The prompt and every turn-lane
+   * field are validated EAGERLY here (a plain method that throws, then returns the
+   * generator), so an invalid task throws at call time — not deferred to the first `next()`.
+   *
+   * Session (since 0.1.3): agy's first line is `{"event":"init","conversation_id":…}`; its id
+   * — the CLI's own report, never `task.resumeId` echoed back — emits a `session` event, and a
+   * later different id (a step's, or the terminal payload's) emits another. For an id it does
+   * not know, agy prints `warning: conversation "…" not found` and SILENTLY starts a new
+   * conversation (measured on agy 1.3.6): the `session` id then differs from `resumeId`.
+   *
+   * Turn lane (since 0.1.3), argv: `[--conversation <id>] --output-format stream-json
+   * [--model <m>] [--mode <mode>] [--dangerously-skip-permissions] [extra.args] -p <prompt>` —
+   * `--mode` again on every turn, the prompt directly after `-p`, and
+   * `--dangerously-skip-permissions` ONLY with `elevated` (agy print mode calls MCP tools only
+   * under it; it also approves every shell command). Measured on agy 1.3.6.
    */
-  stream(task: RunTask): AsyncGenerator<RunEvent> {
+  stream(task: RunTask, opts?: RunOptions): AsyncGenerator<RunEvent> {
     if (!isNonEmpty(task.prompt)) {
       throw new AgentMeshError('run: prompt must be a non-empty string', VENDOR);
     }
-    return this.streamEvents(task);
+    const plan = planTurn(task);
+    return this.streamEvents(task, plan, opts);
+  }
+
+  /** Antigravity has no interactive take-over in this release. */
+  interactiveResume(_conversationId: string, _account?: Account): undefined {
+    return undefined;
   }
 
   /**
-   * The generator behind {@link stream}; the prompt is already validated.
+   * The generator behind {@link stream}; the task is already validated.
    *
-   * `init` records the conversation id and emits nothing. `step_update` emits a
-   * `text` event ONLY for a `step_type` of `agent_response` with a non-empty
-   * `text_delta` — every other step type (`user_input`, `checkpoint`, ...) is skipped
-   * because RunEvent has no semantics for it and per-step usage is partial. A delta's
-   * single trailing newline is held back and emitted only when more text follows (and
-   * dropped at end of stream), so concatenated `text` events equal the newline-normalized
-   * `done.text`. A terminal payload — the `result` event OR a bare object carrying
-   * `status`/`response` (the error path / older CLI generations) — emits a `usage` event
-   * (when usage mapped) then a `done` event built by the single {@link mapPayload} mapper.
-   * Non-JSON lines are skipped.
+   * `init` records the conversation id. `step_update` emits a `text` event ONLY for a
+   * `step_type` of `agent_response` with a non-empty `text_delta` — every other step type
+   * (`user_input`, `checkpoint`, ...) is skipped because RunEvent has no semantics for it and
+   * per-step usage is partial. A delta's single trailing newline is held back and emitted only
+   * when more text follows (and dropped at end of stream), so concatenated `text` events equal
+   * the newline-normalized `done.text`. A terminal payload — the `result` event OR a bare
+   * object carrying `status`/`response` (the error path / older CLI generations) — emits a
+   * `usage` event (when usage mapped) then a `done` event built by the single
+   * {@link mapPayload} mapper. Non-JSON lines are skipped. Nothing follows the terminal event:
+   * later lines are drained but emit nothing.
    *
    * Failure fidelity mirrors run(): a TIMEOUT with no `result` event emits a `done`
    * with `status:'incomplete'`, the timeout note, the accumulated partial text and any
    * conversation id seen — never an `error` event. A non-zero EXIT with no `result`
    * event emits an `error` whose message carries the exit code and the stderr tail.
    */
-  private async *streamEvents(task: RunTask): AsyncGenerator<RunEvent> {
+  private async *streamEvents(task: RunTask, plan: TurnPlan, opts?: RunOptions): AsyncGenerator<RunEvent> {
     const notes: string[] = [];
     if (task.allowedTools && task.allowedTools.length > 0) notes.push(ALLOWED_TOOLS_NOTE);
     const model = resolveModel(task.model);
     if (model && !isKnownModel(model)) notes.push(unknownModelNote(model));
     const extra = extraArgs(task.extra);
     if (extra.dropped > 0) notes.push(droppedArgsNote(extra.dropped));
+    notes.push(...plan.notes);
+    let prompt: string;
+    try {
+      prompt = await this.composePrompt(task.prompt, plan.appendSystemPromptFile, notes);
+    } catch (e) {
+      yield { type: 'error', message: errorMessage(e) };
+      return;
+    }
 
-    const args = this.buildRunArgs(task, 'stream-json', model, extra.args);
-    const { env, note: envNote } = this.childEnv(task.account);
+    const args = this.buildRunArgs(task, 'stream-json', model, extra.args, plan, prompt);
+    const { env, note: envNote } = this.childEnv(task.account, opts);
     if (envNote) notes.push(envNote);
+    // A per-run seam (RunOptions.lineStream) is the ONLY seam this run spawns through.
+    const lineStream: LineStreamFn = opts?.lineStream ?? this.lineStream;
+    // The id a resumed run falls back to when the CLI reports none (as resume() does).
+    const fallbackId = plan.resumeId ?? '';
 
     let conversationId = '';
+    let reportedId = '';
     let textSoFar = '';
     // A held-back trailing newline (see splitTrailingNewline): buffered so it is emitted
     // only when more text follows, and dropped at end of stream — so concatenated deltas
@@ -436,12 +642,13 @@ export class GeminiAdapter implements Adapter {
     let emittedDone = false;
     let endMeta: StreamEndMeta | undefined;
     try {
-      for await (const line of this.lineStream(
+      for await (const line of lineStream(
         { cmd: this.binary, args, cwd: task.cwd, env, timeoutMs: task.timeoutMs },
         (meta) => {
           endMeta = meta;
         },
       )) {
+        if (emittedDone) continue; // drain: nothing follows the terminal event
         const trimmed = line.trim();
         if (trimmed.length === 0) continue;
         let event: unknown;
@@ -453,16 +660,25 @@ export class GeminiAdapter implements Adapter {
         if (!isRecord(event)) continue;
         const kind = typeof event.event === 'string' ? event.event : '';
 
+        // The conversation id as agy reports it: init's (any), a step's (until one is known).
         if (kind === 'init') {
           const id = event.conversation_id;
           if (typeof id === 'string' && id.length > 0) conversationId = id;
+        } else if (kind === 'step_update' && conversationId.length === 0) {
+          const step = isRecord(event.step_update) ? event.step_update : undefined;
+          const cid = step?.conversation_id;
+          if (typeof cid === 'string' && cid.length > 0) conversationId = cid;
+        }
+        if (conversationId.length > 0 && conversationId !== reportedId) {
+          reportedId = conversationId;
+          yield { type: 'session', conversationId };
+        }
+
+        if (kind === 'init') {
+          continue;
         } else if (kind === 'step_update') {
           const su = isRecord(event.step_update) ? event.step_update : undefined;
           if (!su) continue;
-          if (conversationId.length === 0) {
-            const cid = su.conversation_id;
-            if (typeof cid === 'string' && cid.length > 0) conversationId = cid;
-          }
           if (su.step_type === 'agent_response' && typeof su.text_delta === 'string' && su.text_delta.length > 0) {
             // Hold a single trailing newline back; interior newlines are content.
             const [body, trailing] = splitTrailingNewline(heldNewline + su.text_delta);
@@ -485,15 +701,27 @@ export class GeminiAdapter implements Adapter {
                 : undefined;
           if (!payload) continue;
           const mapped = mapPayload(payload);
+          if (mapped.conversationId.length > 0 && mapped.conversationId !== reportedId) {
+            reportedId = mapped.conversationId;
+            yield { type: 'session', conversationId: mapped.conversationId };
+          }
           if (mapped.usage) yield { type: 'usage', usage: mapped.usage };
           const doneNotes = [...notes];
           if (mapped.errorNote) doneNotes.push(mapped.errorNote);
           emittedDone = true;
-          yield { type: 'done', result: this.assemble(mapped, doneNotes, model, payload) };
+          yield {
+            type: 'done',
+            result: this.assemble(
+              { ...mapped, conversationId: mapped.conversationId || fallbackId },
+              doneNotes,
+              model,
+              payload,
+            ),
+          };
         }
       }
     } catch (e) {
-      yield { type: 'error', message: errorMessage(e) };
+      if (!emittedDone) yield { type: 'error', message: errorMessage(e) };
       return;
     }
     if (emittedDone) return;
@@ -504,7 +732,7 @@ export class GeminiAdapter implements Adapter {
       yield {
         type: 'done',
         result: this.assemble(
-          { conversationId, text: textSoFar, status: 'incomplete' },
+          { conversationId: conversationId || fallbackId, text: textSoFar, status: 'incomplete' },
           doneNotes,
           model,
           undefined,
@@ -523,22 +751,60 @@ export class GeminiAdapter implements Adapter {
    * ----------------------------------------------------------------------- */
 
   /**
-   * Build the argv shared by run() and stream(): `--output-format <format>`, then
-   * optional `--model` / `--mode` (permissionMode passed through verbatim), then
-   * `extra.args`, then `-p` and the prompt LAST. No `--` fence (see run()).
+   * Build the argv shared by run() and stream(): `--conversation <id>` (with `resumeId`), then
+   * `--output-format <format>`, then optional `--model` / `--mode` (permissionMode passed
+   * through verbatim) / `--dangerously-skip-permissions` (ONLY with `elevated`), then
+   * `extra.args`, then `-p` and the prompt LAST. No `--` fence (see run()). With no turn-lane
+   * field it is exactly the 0.1.2 argv.
    */
   private buildRunArgs(
     task: RunTask,
     format: 'json' | 'stream-json',
     model: string | undefined,
     extraStrArgs: string[],
+    plan: TurnPlan,
+    prompt: string,
   ): string[] {
-    const args = ['--output-format', format];
+    const args: string[] = [];
+    if (plan.resumeId !== undefined) args.push('--conversation', plan.resumeId);
+    args.push('--output-format', format);
     if (model) args.push('--model', model); // already trimmed/resolved by the caller
     if (isNonEmpty(task.permissionMode)) args.push('--mode', task.permissionMode);
+    if (plan.elevated) args.push('--dangerously-skip-permissions');
     args.push(...extraStrArgs);
-    args.push('-p', task.prompt); // prompt is ALWAYS the final argv element
+    args.push('-p', prompt); // prompt is ALWAYS the final argv element, directly after -p
     return args;
+  }
+
+  /**
+   * The prompt for this run (since 0.1.3): with `appendSystemPromptFile`, the file's content
+   * (trimmed), a blank line, then the prompt — agy has no system-prompt flag — and a note saying
+   * so. An unreadable file, or one over 256 KiB, throws.
+   */
+  private async composePrompt(prompt: string, file: string | undefined, notes: string[]): Promise<string> {
+    if (file === undefined) return prompt;
+    let text: string | null;
+    try {
+      text = await this.readTextFile(file);
+    } catch {
+      text = null;
+    }
+    if (text === null) {
+      throw new AgentMeshError(`agy appendSystemPromptFile could not be read: ${file}`, VENDOR);
+    }
+    if (Buffer.byteLength(text, 'utf8') > APPEND_PROMPT_MAX_BYTES) {
+      throw new AgentMeshError(
+        `agy appendSystemPromptFile is larger than ${APPEND_PROMPT_MAX_BYTES} bytes: ${file}`,
+        VENDOR,
+      );
+    }
+    const content = text.trim();
+    if (content === '') {
+      notes.push('appendSystemPromptFile is empty; nothing was prefixed');
+      return prompt;
+    }
+    notes.push('appendSystemPromptFile: agy has no system-prompt flag; its content was prefixed to the prompt');
+    return `${content}\n\n${prompt}`;
   }
 
   /**
@@ -551,16 +817,25 @@ export class GeminiAdapter implements Adapter {
   }
 
   /**
-   * Compose the fully resolved child env for a call, plus the AGY_HOME note when one
-   * applies. Account precedence: an explicitly passed `account` is authoritative — with
-   * no `configDir` it means AMBIENT and does NOT fall back to `defaultAccount.configDir`;
-   * only `account === undefined` falls back to the default account. When a config dir
-   * resolves, it is set as `AGY_HOME` — which agy 1.3.5 does not read, hence the note.
+   * Compose the fully resolved child env for a call, plus the note that applies. With
+   * `opts.env` (0.1.3) that env is used VERBATIM (a copy) — no `AGY_HOME` of the adapter's own —
+   * and an explicit `account.configDir` it displaces is noted. Otherwise, account precedence: an
+   * explicitly passed `account` is authoritative — with no `configDir` it means AMBIENT and does
+   * NOT fall back to `defaultAccount.configDir`; only `account === undefined` falls back to the
+   * default account. When a config dir resolves, it is set as `AGY_HOME` — which agy 1.3.5 does
+   * not read, hence the note.
    */
-  private childEnv(account?: unknown): { env: Record<string, string | undefined>; note?: string } {
+  private childEnv(
+    account?: unknown,
+    opts?: RunOptions,
+  ): { env: Record<string, string | undefined>; note?: string } {
     // A null/malformed account is ABSENT (falls back to defaultAccount); a real account
     // object with no configDir is AMBIENT and does NOT inherit defaultAccount.configDir.
     const acct = isRecord(account) ? account : undefined;
+    if (opts?.env) {
+      const explicit = acct !== undefined && typeof acct.configDir === 'string' && acct.configDir !== '';
+      return { env: { ...opts.env }, ...(explicit ? { note: ENV_ACCOUNT_NOTE } : {}) };
+    }
     const configDir = acct
       ? typeof acct.configDir === 'string'
         ? acct.configDir
@@ -575,18 +850,20 @@ export class GeminiAdapter implements Adapter {
   }
 
   /** Spawn the CLI with the built argv, then map stdout/exit into a RunResult. */
-  private async execAndMap(args: string[], ctx: ExecContext): Promise<RunResult> {
-    const { env, note: envNote } = this.childEnv(ctx.account);
+  private async execAndMap(args: string[], ctx: ExecContext, opts?: RunOptions): Promise<RunResult> {
+    const { env, note: envNote } = this.childEnv(ctx.account, opts);
     const notes = [...ctx.notes];
     if (envNote) notes.push(envNote);
-    // resume() ONLY: substitute the caller's trimmed id when the payload echoes none.
-    // run() leaves fallbackConversationId unset, so '' stays '' — never fabricated.
+    // resume() and a resumed run() ONLY: substitute the caller's trimmed id when the payload
+    // echoes none. A fresh run() leaves fallbackConversationId unset, so '' stays '' — never fabricated.
     const withFallbackId = (id: string): string =>
       id.length === 0 && ctx.fallbackConversationId ? ctx.fallbackConversationId : id;
 
-    let res;
+    let res: ExecResult;
     try {
-      res = await this.exec({ cmd: this.binary, args, cwd: ctx.cwd, env, timeoutMs: ctx.timeoutMs });
+      const req: ExecRequest = { cmd: this.binary, args, cwd: ctx.cwd, env, timeoutMs: ctx.timeoutMs };
+      // A per-run seam (RunOptions.lineStream) is the ONLY seam this run spawns through.
+      res = opts?.lineStream ? await execOverLineStream(opts.lineStream, req) : await this.exec(req);
     } catch (err) {
       // Spawn-level failure (e.g. ENOENT: agy not installed).
       throw new AdapterExecError(`agy failed to start: ${errorMessage(err)}`, VENDOR, {

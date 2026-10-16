@@ -109,31 +109,45 @@ function mergeUsage(prev: TokenUsage | undefined, next: TokenUsage): TokenUsage 
   return { ...lo, ...hi };
 }
 
-export function parseCodexEvents(stdout: string): ParsedRun {
-  let conversationId: string | undefined;
-  let lastAgentText: string | undefined;
-  let usage: TokenUsage | undefined;
-  let model: string | undefined;
-  let errorMessage: string | undefined;
-  let lastEvent: Record<string, unknown> | undefined;
+/**
+ * The same parse, one line at a time (since 0.1.3), so `stream()` can map events as they arrive
+ * while ending with exactly the {@link ParsedRun} `run()` gets from the whole stdout. Feed every
+ * stdout line to {@link push}; read {@link result} after the last. Nothing here throws.
+ */
+export class CodexEventParser {
+  private convId: string | undefined;
+  private lastAgentText: string | undefined;
+  private usage: TokenUsage | undefined;
+  private model: string | undefined;
+  private errorMessage: string | undefined;
+  private lastEvent: Record<string, unknown> | undefined;
 
-  for (const line of stdout.split('\n')) {
+  /** The conversation id found so far ('' while none) — the FIRST hit, as in {@link result}. */
+  get conversationId(): string {
+    return this.convId ?? '';
+  }
+
+  /**
+   * Take one stdout line. Returns the parsed event object, or `undefined` for a line that is
+   * blank, not JSON, or not a JSON object (all tolerated and skipped).
+   */
+  push(line: string): Record<string, unknown> | undefined {
     const trimmed = line.trim();
-    if (trimmed.length === 0) continue;
+    if (trimmed.length === 0) return undefined;
     let ev: unknown;
     try {
       ev = JSON.parse(trimmed);
     } catch {
-      continue; // tolerate interleaved non-JSON (banners, progress, log noise)
+      return undefined; // tolerate interleaved non-JSON (banners, progress, log noise)
     }
-    if (!isRecord(ev)) continue;
-    lastEvent = ev;
+    if (!isRecord(ev)) return undefined;
+    this.lastEvent = ev;
 
     const type = typeof ev.type === 'string' ? ev.type : '';
 
     // conversation id — first hit wins; prefer a thread.started event but accept
     // the id keys anywhere, and the nested thread.id form.
-    if (conversationId === undefined) {
+    if (this.convId === undefined) {
       const startish = type.includes('thread.started') || type.includes('session.created');
       const nestedThreadId = isRecord(ev.thread) ? ev.thread.id : undefined;
       const cand = firstString(
@@ -143,49 +157,62 @@ export function parseCodexEvents(stdout: string): ParsedRun {
         nestedThreadId,
         startish ? ev.id : undefined,
       );
-      if (cand) conversationId = cand;
+      if (cand) this.convId = cand;
     }
 
     // final assistant text — last completed agent_message item wins.
     if (type === 'item.completed' && isRecord(ev.item)) {
       const itemType = typeof ev.item.type === 'string' ? ev.item.type : '';
       if (itemType.includes('agent_message') && typeof ev.item.text === 'string') {
-        lastAgentText = ev.item.text;
+        this.lastAgentText = ev.item.text;
       }
     }
 
     // usage — merged field-wise so a later partial cannot clobber a complete one.
     const u = usageFromEvent(ev);
-    if (u) usage = mergeUsage(usage, u);
+    if (u) this.usage = mergeUsage(this.usage, u);
 
     // model id observed in the stream — last hit wins.
     const m = firstString(ev.model, isRecord(ev.item) ? ev.item.model : undefined);
-    if (m) model = m;
+    if (m) this.model = m;
 
     // explicit error event — last message wins.
     if (type === 'error' || isRecord(ev.error) || typeof ev.error === 'string') {
-      errorMessage =
+      this.errorMessage =
         firstString(
           ev.message,
           isRecord(ev.error) ? ev.error.message : undefined,
           typeof ev.error === 'string' ? ev.error : undefined,
-        ) ?? errorMessage;
+        ) ?? this.errorMessage;
     }
+    return ev;
   }
 
-  // fallback: a top-level result string on the final event.
-  const fallbackText =
-    lastEvent !== undefined
-      ? firstString(lastEvent.result, lastEvent.response, lastEvent.last_agent_message)
-      : undefined;
+  /** The run as parsed so far — after the last line, the run's final {@link ParsedRun}. */
+  result(): ParsedRun {
+    const lastEvent = this.lastEvent;
+    // fallback: a top-level result string on the final event.
+    const fallbackText =
+      lastEvent !== undefined
+        ? firstString(lastEvent.result, lastEvent.response, lastEvent.last_agent_message)
+        : undefined;
 
-  const result: ParsedRun = {
-    conversationId: conversationId ?? '',
-    text: lastAgentText ?? fallbackText ?? '',
-  };
-  if (usage) result.usage = usage;
-  if (model) result.model = model;
-  if (errorMessage) result.errorMessage = errorMessage;
-  if (lastEvent !== undefined) result.raw = lastEvent;
-  return result;
+    const result: ParsedRun = {
+      conversationId: this.convId ?? '',
+      text: this.lastAgentText ?? fallbackText ?? '',
+    };
+    if (this.usage) result.usage = this.usage;
+    if (this.model) result.model = this.model;
+    if (this.errorMessage) result.errorMessage = this.errorMessage;
+    if (lastEvent !== undefined) result.raw = lastEvent;
+    return result;
+  }
+}
+
+export function parseCodexEvents(stdout: string): ParsedRun {
+  const parser = new CodexEventParser();
+  for (const line of stdout.split('\n')) {
+    parser.push(line);
+  }
+  return parser.result();
 }

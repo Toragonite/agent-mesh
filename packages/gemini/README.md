@@ -61,7 +61,9 @@ for await (const ev of agy.stream({ prompt: 'Write a haiku about routing.', time
 
 Streaming maps `agy --output-format stream-json` to agent-mesh `RunEvent`s:
 
-- The stream's `init` event only records the conversation id.
+- The stream's `init` event records the conversation id and reports it as a `session` event
+  (since 0.1.3) — agy's own report, never `resumeId` echoed back; a later different id (a
+  step's, or the terminal payload's) is reported again before `done`.
 - Only an `agent_response` step with a non-empty `text_delta` becomes a `text` event. Other
   step types (`user_input`, `checkpoint`, …) are **skipped** — the contract has no event for
   them, and their per-step `usage` is partial, not authoritative.
@@ -81,6 +83,40 @@ Streaming maps `agy --output-format stream-json` to agent-mesh `RunEvent`s:
 - If the stream ends with no terminal payload: a **timeout** yields a `done` result with
   `status: 'incomplete'` and a timeout note (never an `error` event); a non-zero **exit** yields
   an `error` event whose message includes the exit code and the child's stderr tail.
+- The stream ends with exactly one `done` or `error`: lines after the terminal payload are
+  drained but emit nothing.
+
+## Turns: resume, `--mode`, MCP (since 0.1.3)
+
+`run()` and `stream()` take the turn-lane fields of `RunTask` and an optional `RunOptions`
+second argument. Measured on agy 1.3.6, the argv is:
+
+```
+[--conversation <id>] --output-format stream-json [--model <m>] [--mode <mode>]
+   [--dangerously-skip-permissions] [extra.args] -p <prompt>
+```
+
+- **`resumeId`** → `--conversation <id>`; `--mode` is passed again on every turn, and the prompt
+  always directly follows `-p`. No `--print-timeout` is passed: print mode waits for the turn by
+  default.
+- **Unknown ids.** For an id it does not know, agy prints `warning: conversation "…" not found`
+  and **silently starts a new conversation**: the `session` id then differs from `resumeId` —
+  compare the two after every resumed turn. When agy reports no id at all, the result falls back
+  to `resumeId`, as `resume()` does.
+- **`elevated: true`** → `--dangerously-skip-permissions`, never added otherwise. agy print mode
+  calls MCP tools **only** under this flag (which also approves every shell command): the
+  servers come from the `.agents/mcp_config.json` YOU write in the run's `cwd`, and an `mcp`
+  attachment without `elevated` adds a note saying its tools will not be called.
+- **`appendSystemPromptFile`** — no agy flag: the file's content is prefixed to the `-p` value,
+  with a note (read through the new `readTextFile` constructor seam). `sessionId`,
+  `disallowedTools`, `settingSources` and `mcp.projectConfigFile` are ignored with a note;
+  `unattended` needs nothing.
+- **`RunOptions`** — `lineStream` is the only seam the run spawns through; `env` is the child's
+  whole environment, used verbatim (no `AGY_HOME` of the adapter's own).
+- `interactiveResume()` returns `undefined`: no interactive take-over in this release.
+- The process seam exports `interruptLadder(proc)` (SIGINT to the CLI process only, then
+  SIGTERM and SIGKILL to its process group) for the `SpawnedProcess` that `ExecRequest.onSpawn`
+  reports, and `execOverLineStream(lineStream, req)`.
 
 ## Models
 

@@ -21,8 +21,15 @@
  * - The workspace-trust gate EXITS (does not hang) after ~21s; `--trust` skips it.
  * - `cursor-agent create-chat` mints a bare UUID; `--resume <id>` preserves context.
  * - A one-word answer takes ~30s — the slowest vendor in this repo.
+ * - For a well-formed but UNKNOWN chat id, `--resume` silently starts a NEW chat (a non-UUID id
+ *   is an error): the `session` event of a resumed `stream()` is how a caller notices.
+ *
+ * Since 0.1.3 `run()` and `stream()` also drive the turn lane: `resumeId` → `--resume <id>`,
+ * `mcp` → `--approve-mcps` (over the `.cursor/mcp.json` the caller wrote in the cwd), and
+ * `elevated` → `--force` — the only way this adapter ever passes `--force`.
  */
 import { readFile } from 'node:fs/promises';
+import * as path from 'node:path';
 import {
   AdapterExecError,
   AgentMeshError,
@@ -30,16 +37,27 @@ import {
   type Adapter,
   type AdapterCapabilities,
   type AuthStatus,
+  type McpAttachment,
   type ModelInfo,
   type QuotaSnapshot,
   type ResumeOptions,
   type RunEvent,
+  type RunOptions,
   type RunResult,
   type RunStatus,
   type RunTask,
   type Vendor,
 } from '@toragonite/agent-mesh';
-import { nodeExec, nodeLineStream, type ExecFn, type LineStreamFn, type StreamEndMeta } from './exec.js';
+import {
+  execOverLineStream,
+  nodeExec,
+  nodeLineStream,
+  type ExecFn,
+  type ExecRequest,
+  type ExecResult,
+  type LineStreamFn,
+  type StreamEndMeta,
+} from './exec.js';
 import { curatedModels, cloneModel, parseModelsOutput } from './models.js';
 import { isRecord, mapResultPayload, parseCursorJson, str, type MappedResult } from './parse.js';
 import { homedir } from 'node:os';
@@ -132,8 +150,9 @@ export interface CursorAdapterOptions {
    * Whether to pass `--trust` (default TRUE). A library driving a headless agent
    * in a directory the CALLER chose must not stall ~21s per task on an interactive
    * trust prompt — choosing to run a coding agent in that cwd IS the trust
-   * decision. `--force`/`--yolo` is a stronger, different grant (run everything);
-   * this adapter NEVER passes it.
+   * decision. `--force`/`--yolo` is a stronger, different grant (run commands
+   * unless explicitly denied); this adapter passes it ONLY for a task that sets
+   * `elevated: true` (since 0.1.3), never by default.
    */
   trust?: boolean;
   /** Short-circuit the live `cursor-agent models` read (hermetic tests / offline use). */
@@ -196,6 +215,127 @@ function trustMessage(cwd: string | undefined): string {
 /** Notes accumulated before/around a run; assembled into RunResult.note joined with '; '. */
 function joinNotes(notes: string[]): string | undefined {
   return notes.length > 0 ? notes.join('; ') : undefined;
+}
+
+/* ------------------------------------------------------------------------- *
+ * The turn-lane fields of a task (0.1.3) — validated BEFORE anything spawns.
+ * ------------------------------------------------------------------------- */
+
+/** `McpAttachment.name`: a lowercase identifier. */
+const MCP_NAME = /^[a-z][a-z0-9_]{0,31}$/;
+/** C0 control characters and DEL — never part of a path or a value handed to the CLI. */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** The largest `appendSystemPromptFile` whose content is prefixed to a prompt. */
+const APPEND_PROMPT_MAX_BYTES = 256 * 1024;
+
+/** The validated turn-lane plan of one run()/stream() call. */
+interface TurnPlan {
+  /** Continue this chat (`--resume <id>`). */
+  resumeId?: string;
+  /** Attach the caller's `.cursor/mcp.json` servers with `--approve-mcps`. */
+  mcp?: McpAttachment;
+  appendSystemPromptFile?: string;
+  /** Pass `--force`. */
+  elevated: boolean;
+  /** Notes for the fields this adapter ignores, in their stable order. */
+  notes: string[];
+}
+
+/** A conversation id field: trimmed; blank or `-`-leading throws. `undefined` stays absent. */
+function conversationIdField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) return undefined;
+  const id = typeof raw === 'string' ? raw.trim() : '';
+  if (id === '') {
+    throw new AgentMeshError(`cursor ${field} must be a non-empty conversation id`, VENDOR);
+  }
+  if (id.startsWith('-')) {
+    throw new AgentMeshError(`cursor ${field} must not start with "-" (would parse as a CLI flag)`, VENDOR);
+  }
+  return id;
+}
+
+/** An absolute-path field (no control characters). `undefined` stays absent; anything else throws. */
+function absolutePathField(raw: unknown, field: string): string | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string' || !path.isAbsolute(raw) || CONTROL_CHARS.test(raw)) {
+    throw new AgentMeshError(`cursor ${field} must be an absolute path`, VENDOR);
+  }
+  return raw;
+}
+
+/** Validate an {@link McpAttachment}: every field is checked by value; a bad one throws. */
+function mcpField(raw: unknown): McpAttachment {
+  if (!isRecord(raw)) {
+    throw new AgentMeshError('cursor mcp must be an object { name, command, args, configFile }', VENDOR);
+  }
+  const { name, command, args } = raw;
+  if (typeof name !== 'string' || !MCP_NAME.test(name)) {
+    throw new AgentMeshError('cursor mcp.name must match /^[a-z][a-z0-9_]{0,31}$/', VENDOR);
+  }
+  if (typeof command !== 'string' || command.trim() === '' || CONTROL_CHARS.test(command)) {
+    throw new AgentMeshError('cursor mcp.command must be a non-empty string without control characters', VENDOR);
+  }
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && !CONTROL_CHARS.test(a))) {
+    throw new AgentMeshError('cursor mcp.args must be an array of strings without control characters', VENDOR);
+  }
+  const configFile = absolutePathField(raw.configFile, 'mcp.configFile');
+  if (configFile === undefined) {
+    throw new AgentMeshError('cursor mcp.configFile must be an absolute path', VENDOR);
+  }
+  const projectConfigFile = absolutePathField(raw.projectConfigFile, 'mcp.projectConfigFile');
+  return {
+    name,
+    command,
+    args: args.map((a) => String(a)),
+    configFile,
+    ...(projectConfigFile !== undefined ? { projectConfigFile } : {}),
+  };
+}
+
+/** A tool-name list field: must be an array when present; returns whether it names any tool. */
+function namesAnyTool(raw: unknown, field: string): boolean {
+  if (raw === undefined) return false;
+  if (!Array.isArray(raw)) {
+    throw new AgentMeshError(`cursor ${field} must be an array of tool names`, VENDOR);
+  }
+  return raw.some((t) => typeof t === 'string' && t.trim() !== '');
+}
+
+/**
+ * Validate the turn-lane fields of `task` (synchronously — so `stream()` throws at call time).
+ * Throws AgentMeshError for: a blank or flag-shaped `resumeId`; `resumeId` together with
+ * `sessionId`; a relative `appendSystemPromptFile`; an invalid `mcp`; a non-array `disallowedTools`.
+ */
+function planTurn(task: RunTask): TurnPlan {
+  const notes: string[] = [];
+  const resumeId = conversationIdField(task.resumeId, 'resumeId');
+  if (task.sessionId !== undefined) {
+    if (resumeId !== undefined) {
+      throw new AgentMeshError(
+        'cursor sessionId and resumeId are mutually exclusive: sessionId starts a conversation, resumeId continues one',
+        VENDOR,
+      );
+    }
+    notes.push('sessionId not supported by cursor-agent (pre-allocate with createChat() and pass it as resumeId); ignored');
+  }
+  const appendSystemPromptFile = absolutePathField(task.appendSystemPromptFile, 'appendSystemPromptFile');
+  const mcp = task.mcp === undefined ? undefined : mcpField(task.mcp);
+  if (namesAnyTool(task.disallowedTools, 'disallowedTools')) {
+    notes.push('disallowedTools not supported by cursor-agent; ignored');
+  }
+  if (isNonEmpty(task.settingSources)) {
+    notes.push('settingSources not supported by cursor-agent; ignored');
+  }
+  if (mcp?.projectConfigFile !== undefined) {
+    notes.push('mcp.projectConfigFile is not supported by cursor-agent; ignored');
+  }
+  return {
+    ...(resumeId !== undefined ? { resumeId } : {}),
+    ...(mcp !== undefined ? { mcp } : {}),
+    ...(appendSystemPromptFile !== undefined ? { appendSystemPromptFile } : {}),
+    elevated: task.elevated === true,
+    notes,
+  };
 }
 
 interface MapContext {
@@ -414,16 +554,20 @@ export class CursorAdapter implements Adapter {
 
   /**
    * Start a headless run. Argv order: `-p` → `--output-format json` → `--trust`
-   * (when trust resolves true) → `--model` → `--sandbox` → `extra.args` → `--` →
-   * prompt. The `--` fence is mandatory (ground truth A) and the prompt is ALWAYS
-   * the final argv element. A blank prompt throws before spawning; a timeout
-   * resolves an `incomplete` result (never throws); a trust refusal or a non-zero
-   * exit with no parseable payload throws AdapterExecError.
+   * (when trust resolves true) → `--approve-mcps` (with `mcp`) → `--resume <id>` (with
+   * `resumeId`) → `--model` → `--sandbox` → `--force` (ONLY with `elevated`) →
+   * `extra.args` → `--` → prompt. The `--` fence is mandatory (ground truth A) and the
+   * prompt is ALWAYS the final argv element. A blank prompt or an invalid turn-lane
+   * field throws before spawning; a timeout resolves an `incomplete` result (never
+   * throws); a trust refusal or a non-zero exit with no parseable payload throws
+   * AdapterExecError. `opts.lineStream` (since 0.1.3) is then the only seam the run
+   * spawns through, and `opts.env` the child's whole environment.
    */
-  async run(task: RunTask): Promise<RunResult> {
+  async run(task: RunTask, opts?: RunOptions): Promise<RunResult> {
     if (!isNonEmpty(task.prompt)) {
       throw new AgentMeshError('cursor run requires a non-empty prompt', VENDOR);
     }
+    const plan = planTurn(task);
     // U2: a provided-but-blank model is ABSENT (no flag, no note); a real value is trimmed and verbatim.
     const model = task.model?.trim() || undefined;
     const { args: extras, dropped } = extraArgs(task.extra);
@@ -434,19 +578,21 @@ export class CursorAdapter implements Adapter {
       permissionMode: task.permissionMode,
       droppedArgs: dropped,
     });
-    const args = ['-p', '--output-format', 'json'];
-    if (this.trust) args.push('--trust');
-    if (model) args.push('--model', model);
-    if (isNonEmpty(task.permissionMode)) args.push('--sandbox', task.permissionMode);
-    args.push(...extras);
-    args.push('--', task.prompt); // prompt is ALWAYS the final argv element
+    notes.push(...plan.notes);
+    const prompt = await this.composePrompt(task.prompt, plan.appendSystemPromptFile, notes);
+    const args = this.buildArgs('json', plan, model, task.permissionMode, extras, prompt);
 
-    return this.execAndMap(args, {
-      cwd: task.cwd,
-      timeoutMs: task.timeoutMs,
-      modelOverride: model,
-      notes,
-    });
+    return this.execAndMap(
+      args,
+      {
+        cwd: task.cwd,
+        timeoutMs: task.timeoutMs,
+        modelOverride: model,
+        notes,
+        ...(plan.resumeId !== undefined ? { fallbackId: plan.resumeId } : {}),
+      },
+      opts,
+    );
   }
 
   /**
@@ -505,8 +651,9 @@ export class CursorAdapter implements Adapter {
    * returns the generator), so a blank prompt throws before spawn.
    *
    * Event mapping mirrors the run() semantics:
-   * - `system`/`init` records the session id and emits nothing; `user` and
-   *   `thinking` events emit nothing (RunEvent has no thinking channel — see README);
+   * - `system`/`init` records the session id (reported as a `session` event — see
+   *   below) and emits nothing else; `user` and `thinking` events emit nothing
+   *   (RunEvent has no thinking channel — see README);
    * - `assistant` text blocks become `text` events, EXCEPT the final full-answer
    *   repeat, suppressed by the vendor's OWN discriminator ONLY: it is the one
    *   assistant event with no `timestamp_ms` (ground truth E: the deltas "RAW","-C"
@@ -518,16 +665,36 @@ export class CursorAdapter implements Adapter {
    * Failure fidelity: a TIMEOUT emits a `done`/`incomplete` with the accumulated
    * partials (never an error); a non-zero exit with no result emits an `error`
    * with the exit code and stderr tail; a trust refusal emits an `error` carrying
-   * the same remediation as the run() path.
+   * the same remediation as the run() path. The stream ends with exactly one `done`
+   * or `error`: lines after the terminal `result` are drained but emit nothing.
+   *
+   * Session (since 0.1.3): the first line carrying a `session_id` (normally
+   * `system`/`init`) emits a `session` event with that id — the CLI's own report,
+   * never `task.resumeId` echoed back — and a later line with a different id emits
+   * another. For a well-formed but unknown `resumeId` cursor-agent SILENTLY starts a
+   * new chat (measured on cursor-agent 2026.10.14): the `session` id then differs from
+   * `resumeId`, which is how a caller notices.
+   *
+   * Turn lane (since 0.1.3), argv: `-p --output-format stream-json --stream-partial-output
+   * [--trust] [--approve-mcps] [--resume <id>] [--model <m>] [--sandbox <mode>] [--force]
+   * [extra.args] -- <prompt>` — `--approve-mcps` with `mcp` (the caller wrote
+   * `<cwd>/.cursor/mcp.json`), `--resume` with `resumeId`, `--force` ONLY with `elevated`,
+   * and `--sandbox` again on every turn. Measured on cursor-agent 2026.10.14.
    */
-  stream(task: RunTask): AsyncGenerator<RunEvent> {
+  stream(task: RunTask, opts?: RunOptions): AsyncGenerator<RunEvent> {
     if (!isNonEmpty(task.prompt)) {
       throw new AgentMeshError('cursor run requires a non-empty prompt', VENDOR);
     }
-    return this.streamEvents(task);
+    const plan = planTurn(task);
+    return this.streamEvents(task, plan, opts);
   }
 
-  private async *streamEvents(task: RunTask): AsyncGenerator<RunEvent> {
+  /** Cursor has no interactive take-over in this release. */
+  interactiveResume(_conversationId: string, _account?: Account): undefined {
+    return undefined;
+  }
+
+  private async *streamEvents(task: RunTask, plan: TurnPlan, opts?: RunOptions): AsyncGenerator<RunEvent> {
     // U2: a provided-but-blank model is ABSENT; a real value is trimmed and verbatim.
     const model = task.model?.trim() || undefined;
     const { args: extras, dropped } = extraArgs(task.extra);
@@ -539,15 +706,23 @@ export class CursorAdapter implements Adapter {
       permissionMode: task.permissionMode,
       droppedArgs: dropped,
     });
+    notes.push(...plan.notes);
+    let prompt: string;
+    try {
+      prompt = await this.composePrompt(task.prompt, plan.appendSystemPromptFile, notes);
+    } catch (e) {
+      yield { type: 'error', message: errorMessage(e) };
+      return;
+    }
 
-    const args = ['-p', '--output-format', 'stream-json', '--stream-partial-output'];
-    if (this.trust) args.push('--trust');
-    if (model) args.push('--model', model);
-    if (isNonEmpty(task.permissionMode)) args.push('--sandbox', task.permissionMode);
-    args.push(...extras);
-    args.push('--', task.prompt);
+    const args = this.buildArgs('stream-json', plan, model, task.permissionMode, extras, prompt);
+    // A per-run seam (RunOptions.lineStream) is the ONLY seam this run spawns through.
+    const lineStream: LineStreamFn = opts?.lineStream ?? this.lineStream;
+    // The id a resumed run falls back to when the CLI reports none (as resume() does).
+    const fallbackId = plan.resumeId ?? '';
 
     let sessionId = '';
+    let reportedSession = '';
     let textSoFar = '';
     let emittedDone = false;
     let endMeta: StreamEndMeta | undefined;
@@ -555,18 +730,19 @@ export class CursorAdapter implements Adapter {
     // own output (plus the stderr tail) — not the stderr tail alone — to detect it.
     let outputHead = '';
     try {
-      for await (const line of this.lineStream(
+      for await (const line of lineStream(
         {
           cmd: this.binary,
           args,
           cwd: task.cwd,
-          env: { ...this.env },
+          env: this.childEnv(opts),
           timeoutMs: task.timeoutMs,
         },
         (meta) => {
           endMeta = meta;
         },
       )) {
+        if (emittedDone) continue; // drain: nothing follows the terminal event
         const trimmed = line.trim();
         if (!trimmed) continue;
         if (outputHead.length < TRUST_SCAN_CAP) {
@@ -581,7 +757,13 @@ export class CursorAdapter implements Adapter {
         if (!isRecord(event)) continue;
 
         const sid = str(event, 'session_id');
-        if (sid) sessionId = sid;
+        if (sid) {
+          sessionId = sid;
+          if (sid !== reportedSession) {
+            reportedSession = sid;
+            yield { type: 'session', conversationId: sid };
+          }
+        }
 
         const type = event.type;
         if (type === 'system' || type === 'user' || type === 'thinking') {
@@ -612,12 +794,12 @@ export class CursorAdapter implements Adapter {
           const mapped = mapResultPayload(event);
           if (mapped.usage) yield { type: 'usage', usage: mapped.usage };
           emittedDone = true;
-          yield { type: 'done', result: this.streamDone(mapped, sessionId, model, notes) };
+          yield { type: 'done', result: this.streamDone(mapped, sessionId || fallbackId, model, notes) };
           continue;
         }
       }
     } catch (e) {
-      yield { type: 'error', message: errorMessage(e) };
+      if (!emittedDone) yield { type: 'error', message: errorMessage(e) };
       return;
     }
 
@@ -627,7 +809,7 @@ export class CursorAdapter implements Adapter {
     if (endMeta?.timedOut) {
       const done: RunResult = {
         vendor: VENDOR,
-        conversationId: sessionId,
+        conversationId: sessionId || fallbackId,
         text: textSoFar,
         status: 'incomplete',
       };
@@ -763,18 +945,85 @@ export class CursorAdapter implements Adapter {
     return result;
   }
 
-  /** Spawn the CLI with the built argv, then map stdout/exit into a RunResult. */
-  private async execAndMap(args: string[], ctx: MapContext): Promise<RunResult> {
-    let res;
+  /**
+   * The argv shared by run() and stream() (since 0.1.3). With no turn-lane field it is
+   * exactly the 0.1.2 argv; see {@link stream} for where each turn-lane flag goes.
+   */
+  private buildArgs(
+    format: 'json' | 'stream-json',
+    plan: TurnPlan,
+    model: string | undefined,
+    permissionMode: string | undefined,
+    extras: string[],
+    prompt: string,
+  ): string[] {
+    const args = ['-p', '--output-format', format];
+    if (format === 'stream-json') args.push('--stream-partial-output');
+    if (this.trust) args.push('--trust');
+    if (plan.mcp) args.push('--approve-mcps');
+    if (plan.resumeId !== undefined) args.push('--resume', plan.resumeId);
+    if (model) args.push('--model', model);
+    if (isNonEmpty(permissionMode)) args.push('--sandbox', permissionMode);
+    if (plan.elevated) args.push('--force');
+    args.push(...extras);
+    args.push('--', prompt); // prompt is ALWAYS the final argv element
+    return args;
+  }
+
+  /**
+   * The prompt for this run (since 0.1.3): with `appendSystemPromptFile`, the file's content
+   * (trimmed), a blank line, then the prompt — cursor-agent has no system-prompt flag — and a note
+   * saying so. An unreadable file, or one over 256 KiB, throws.
+   */
+  private async composePrompt(prompt: string, file: string | undefined, notes: string[]): Promise<string> {
+    if (file === undefined) return prompt;
+    let text: string | null;
     try {
-      res = await this.exec({
+      text = await this.readTextFile(file);
+    } catch {
+      text = null;
+    }
+    if (text === null) {
+      throw new AgentMeshError(`cursor appendSystemPromptFile could not be read: ${file}`, VENDOR);
+    }
+    if (Buffer.byteLength(text, 'utf8') > APPEND_PROMPT_MAX_BYTES) {
+      throw new AgentMeshError(
+        `cursor appendSystemPromptFile is larger than ${APPEND_PROMPT_MAX_BYTES} bytes: ${file}`,
+        VENDOR,
+      );
+    }
+    const content = text.trim();
+    if (content === '') {
+      notes.push('appendSystemPromptFile is empty; nothing was prefixed');
+      return prompt;
+    }
+    notes.push('appendSystemPromptFile: cursor-agent has no system-prompt flag; its content was prefixed to the prompt');
+    return `${content}\n\n${prompt}`;
+  }
+
+  /**
+   * The child env: `opts.env` VERBATIM (a copy) when the caller composed one (since 0.1.3),
+   * else the base seam. cursor-agent has no config-dir env var, so no account variable is ever
+   * added either way.
+   */
+  private childEnv(opts?: RunOptions): Record<string, string | undefined> {
+    return opts?.env ? { ...opts.env } : { ...this.env };
+  }
+
+  /** Spawn the CLI with the built argv, then map stdout/exit into a RunResult. */
+  private async execAndMap(args: string[], ctx: MapContext, opts?: RunOptions): Promise<RunResult> {
+    let res: ExecResult;
+    try {
+      const req: ExecRequest = {
         cmd: this.binary,
         args,
         cwd: ctx.cwd,
         // cursor-agent has no config-dir env var; the child env is just the base seam.
-        env: { ...this.env },
+        env: this.childEnv(opts),
         timeoutMs: ctx.timeoutMs,
-      });
+      };
+      // A per-run seam (RunOptions.lineStream) is the ONLY seam this run spawns through.
+      res = opts?.lineStream ? await execOverLineStream(opts.lineStream, req) : await this.exec(req);
     } catch (err) {
       throw new AdapterExecError(`cursor-agent failed to start: ${errorMessage(err)}`, VENDOR, {
         stderr: truncate(errorMessage(err), STDERR_CAP),
@@ -856,6 +1105,13 @@ export interface CreateChatOptions {
   binary?: string;
   /** Wall-clock cap in ms. */
   timeoutMs?: number;
+  /**
+   * Since 0.1.3: the directory to mint the chat in — run it where the chat's turns will run.
+   * Default: the process's own working directory.
+   */
+  cwd?: string;
+  /** Since 0.1.3: the child's complete environment (as `ExecRequest.env`). Default: inherited. */
+  env?: Record<string, string | undefined>;
 }
 
 /**
@@ -863,12 +1119,19 @@ export interface CreateChatOptions {
  * prints a bare UUID on stdout (ground truth C). Returns the trimmed id, or
  * `null` on any failure (timeout, non-zero exit, empty output, spawn error).
  * Never throws — a null result simply means "mint the id on the first run instead".
+ * Pass the id as the first turn's `resumeId`.
  */
 export async function createChat(opts: CreateChatOptions = {}): Promise<string | null> {
   const exec = opts.exec ?? nodeExec;
   const binary = opts.binary ?? 'cursor-agent';
   try {
-    const res = await exec({ cmd: binary, args: ['create-chat'], timeoutMs: opts.timeoutMs });
+    const res = await exec({
+      cmd: binary,
+      args: ['create-chat'],
+      timeoutMs: opts.timeoutMs,
+      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+      ...(opts.env !== undefined ? { env: { ...opts.env } } : {}),
+    });
     if (res.timedOut || (res.exitCode ?? 0) !== 0) return null;
     const id = res.stdout.trim();
     return id.length > 0 ? id : null;

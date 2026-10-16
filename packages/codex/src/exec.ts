@@ -7,12 +7,44 @@
  * {@link nodeExec} collects a whole run into one buffer, {@link nodeLineStream} yields the
  * child's stdout line by line for streaming consumers.
  *
+ * Since 0.1.3 a request may carry `onSpawn`, which receives a {@link SpawnedProcess} handle for
+ * the started child (its pid, a leader-only signal, a whole-group signal, its exit, and the time
+ * of its last output); {@link interruptLadder} stops a child through that handle the way every
+ * vendor CLI here stops cleanly; {@link execOverLineStream} runs a child to completion through
+ * any {@link LineStreamFn}.
+ *
  * Zero runtime dependencies: Node built-ins only (`child_process`, `readline`).
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import * as readline from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
+
+/**
+ * A started child, as {@link ExecRequest.onSpawn} reports it. The seams start every child
+ * `detached`, alone in its own process group, so its pid is also its process-group id.
+ */
+export interface SpawnedProcess {
+  /** The child's pid — also its process-group id. */
+  readonly pid: number;
+  /** Resolves with the exit code (`null` after a signal death) once the child has exited. Never rejects. */
+  readonly exited: Promise<number | null>;
+  /**
+   * Signal the child ONLY, never its group. Interrupt a run with `signal('SIGINT')` here: a CLI
+   * may ignore a SIGINT sent to its whole group and finish the turn (Codex does). `false` once the
+   * child has exited (its pid may already belong to another process) or when the send fails.
+   */
+  signal(sig: string): boolean;
+  /**
+   * Signal the child's whole process group — the escalation after an interrupt (SIGTERM, then
+   * SIGKILL). `false` once the seam is done with the child (its stdio closed) or when the send fails.
+   */
+  signalGroup(sig: string): boolean;
+  /** True once the child has exited. */
+  hasExited(): boolean;
+  /** Epoch ms of the child's last stdout/stderr output — its spawn time until the first. */
+  lastOutputAt(): number;
+}
 
 /**
  * One process invocation. When `env` is provided it IS the child env — it is NOT merged over
@@ -26,6 +58,12 @@ export interface ExecRequest {
   env?: Record<string, string | undefined>;
   timeoutMs?: number;
   stdin?: string;
+  /**
+   * Since 0.1.3: called once, synchronously, right after the child started, with its
+   * {@link SpawnedProcess} handle. Never called for a spawn that failed; a throw from it is
+   * ignored. A host's own seam that does not know this field simply never calls it.
+   */
+  onSpawn?: (proc: SpawnedProcess) => void;
 }
 
 /** The settled outcome of a run. `exitCode` is null on a signal kill; `timedOut` flags the wall-clock cap. */
@@ -63,11 +101,26 @@ export type LineStreamFn = (
   onEnd?: (meta: StreamEndMeta) => void,
 ) => AsyncIterable<string>;
 
+/** The stages of {@link interruptLadder}, in milliseconds. */
+export interface InterruptLadderStages {
+  /** After the SIGINT, how long the child gets to exit before its group gets SIGTERM. Default 10000. */
+  termAfterMs?: number;
+  /** After the SIGTERM, how long before the group gets SIGKILL. Default 5000. */
+  killAfterMs?: number;
+}
+
 /** SIGTERM → (grace) SIGKILL window once a run trips its timeout. */
 const KILL_GRACE_MS = 5_000;
 
 /** Cap on the stderr tail carried in {@link StreamEndMeta}, so a chatty child can't balloon memory. */
 const STDERR_TAIL_CAP = 4_096;
+
+/** {@link interruptLadder}'s default stages: SIGINT → 10 s → SIGTERM (group) → 5 s → SIGKILL (group). */
+const DEFAULT_TERM_AFTER_MS = 10_000;
+const DEFAULT_KILL_AFTER_MS = 5_000;
+
+/** The largest delay a Node timer honours; a longer one fires after 1 ms instead. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * Signal the child's WHOLE process group, not just the direct child.
@@ -119,6 +172,134 @@ export function buildEnv(env?: Record<string, string | undefined>): NodeJS.Proce
   return out;
 }
 
+/** What a {@link SpawnedProcess} handle reads from the seam that started the child. */
+interface HandleState {
+  /** The child's `'exit'` fired: its pid may be reused from here on. */
+  exited: boolean;
+  /** The seam is done with the child (its stdio closed): no group signal after this. */
+  settled: boolean;
+  /** Epoch ms of the last stdout/stderr chunk. */
+  lastOutputAt: number;
+}
+
+/**
+ * Hand a started child to `req.onSpawn`, if the request has one. Never throws: a child with no
+ * pid (the spawn failed) is not reported, and a throwing callback is ignored.
+ */
+function reportSpawn(
+  req: ExecRequest,
+  child: { pid?: number; kill(signal: NodeJS.Signals): boolean },
+  state: HandleState,
+  exited: Promise<number | null>,
+): void {
+  const onSpawn = req.onSpawn;
+  const pid = child.pid;
+  if (typeof onSpawn !== 'function' || pid === undefined) {
+    return;
+  }
+  const handle: SpawnedProcess = {
+    pid,
+    exited,
+    signal: (sig) => {
+      if (state.exited) {
+        return false;
+      }
+      try {
+        return child.kill(sig as NodeJS.Signals);
+      } catch {
+        return false; // an unknown signal name, or the child is gone
+      }
+    },
+    signalGroup: (sig) => {
+      if (state.settled) {
+        return false;
+      }
+      try {
+        process.kill(-pid, sig as NodeJS.Signals);
+        return true;
+      } catch {
+        return false; // the group is gone (or not permitted), or an unknown signal name
+      }
+    },
+    hasExited: () => state.exited,
+    lastOutputAt: () => state.lastOutputAt,
+  };
+  try {
+    onSpawn(handle);
+  } catch {
+    // a caller's hook never breaks the seam
+  }
+}
+
+/** A non-negative finite stage length, capped to what a Node timer honours, else the default. */
+function stageMs(x: unknown, fallback: number): number {
+  return typeof x === 'number' && Number.isFinite(x) && x >= 0 ? Math.min(x, MAX_TIMER_MS) : fallback;
+}
+
+/**
+ * Stop a child the way every vendor CLI here stops cleanly: SIGINT to the child ONLY; if it has
+ * not exited after `termAfterMs`, SIGTERM to its whole process group; if it still has not exited
+ * after `killAfterMs` more, SIGKILL to the group. The group is never sent SIGINT — a CLI may
+ * ignore a group SIGINT and finish its turn. The ladder ends as soon as the child exits; the
+ * returned function cancels whatever stage is still pending.
+ */
+export function interruptLadder(proc: SpawnedProcess, stages: InterruptLadderStages = {}): () => void {
+  const termAfterMs = stageMs(stages.termAfterMs, DEFAULT_TERM_AFTER_MS);
+  const killAfterMs = stageMs(stages.killAfterMs, DEFAULT_KILL_AFTER_MS);
+  let timer: NodeJS.Timeout | undefined;
+  let finished = false;
+  const stop = (): void => {
+    finished = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+  if (proc.hasExited()) {
+    stop();
+    return stop;
+  }
+  proc.exited.then(stop, stop);
+  proc.signal('SIGINT');
+  timer = setTimeout(() => {
+    if (finished || proc.hasExited()) {
+      stop();
+      return;
+    }
+    proc.signalGroup('SIGTERM');
+    timer = setTimeout(() => {
+      if (!finished && !proc.hasExited()) {
+        proc.signalGroup('SIGKILL');
+      }
+      stop();
+    }, killAfterMs);
+  }, termAfterMs);
+  return stop;
+}
+
+/**
+ * Run a child to completion THROUGH a {@link LineStreamFn}: its stdout lines are joined with
+ * `\n`, and the end metadata gives `exitCode`, `timedOut` and `stderr` (the seam's stderr tail).
+ * This is how a run-to-completion call honours a caller's own line seam. Rejects exactly when
+ * the seam throws (a spawn failure), as an {@link ExecFn} may. A seam that never reports its end
+ * yields `exitCode: null`.
+ */
+export async function execOverLineStream(lineStream: LineStreamFn, req: ExecRequest): Promise<ExecResult> {
+  const lines: string[] = [];
+  let endMeta: StreamEndMeta | undefined;
+  for await (const line of lineStream(req, (meta) => {
+    endMeta = meta;
+  })) {
+    lines.push(line);
+  }
+  return {
+    stdout: lines.join('\n'),
+    stderr: endMeta?.stderrTail ?? '',
+    exitCode: endMeta ? endMeta.exitCode : null,
+    timedOut: endMeta?.timedOut ?? false,
+  };
+}
+
 /**
  * Run a child to completion, collecting stdout and stderr into separate buffers. Resolves the
  * {@link ExecResult}; a synchronous spawn throw or an async 'error' (e.g. ENOENT) REJECTS —
@@ -148,6 +329,11 @@ export const nodeExec: ExecFn = (req) =>
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
+    const handleState: HandleState = { exited: false, settled: false, lastOutputAt: Date.now() };
+    let resolveLeaderExit: (code: number | null) => void = () => {};
+    const leaderExit = new Promise<number | null>((res) => {
+      resolveLeaderExit = res;
+    });
 
     const clearTimers = (): void => {
       if (timeoutTimer) {
@@ -167,9 +353,11 @@ export const nodeExec: ExecFn = (req) =>
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (d) => {
+      handleState.lastOutputAt = Date.now();
       stdout += d;
     });
     child.stderr.on('data', (d) => {
+      handleState.lastOutputAt = Date.now();
       stderr += d;
     });
 
@@ -178,18 +366,22 @@ export const nodeExec: ExecFn = (req) =>
         return;
       }
       settled = true;
+      handleState.settled = true;
       clearTimers();
       reject(e);
     });
     // Belt-and-braces: once a timeout has tripped, drop our read ends as soon as the direct
     // child exits so `'close'` fires promptly even if some inherited FD outlives the group kill.
-    child.on('exit', () => {
+    child.on('exit', (code) => {
+      handleState.exited = true;
+      resolveLeaderExit(code);
       if (timedOut) {
         child.stdout?.destroy();
         child.stderr?.destroy();
       }
     });
     child.on('close', (code) => {
+      handleState.settled = true;
       if (settled) {
         return;
       }
@@ -197,6 +389,8 @@ export const nodeExec: ExecFn = (req) =>
       clearTimers();
       resolve({ stdout, stderr, exitCode: code, timedOut });
     });
+
+    reportSpawn(req, child, handleState, leaderExit);
 
     if (req.timeoutMs !== undefined && req.timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
@@ -252,6 +446,11 @@ export async function* nodeLineStream(
   let exitCode: number | null = null;
   let stderrTail = '';
   let settled = false;
+  const handleState: HandleState = { exited: false, settled: false, lastOutputAt: Date.now() };
+  let resolveLeaderExit: (code: number | null) => void = () => {};
+  const leaderExit = new Promise<number | null>((res) => {
+    resolveLeaderExit = res;
+  });
   // One settle path for both a normal exit and a failed spawn ('error' fires with no 'exit'),
   // so the finally never awaits an exit that will not come.
   let resolveExit: () => void = () => {};
@@ -271,11 +470,14 @@ export async function* nodeLineStream(
   // which both drains the pipe (a chatty child cannot wedge) and preserves a diagnostic tail.
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', (d: string) => {
+    handleState.lastOutputAt = Date.now();
     stderrTail = (stderrTail + d).slice(-STDERR_TAIL_CAP);
   });
   child.stdout.setEncoding('utf8');
 
   child.on('exit', (code) => {
+    handleState.exited = true;
+    resolveLeaderExit(code);
     // Belt-and-braces on a timeout: drop our read ends so readline's stream ends promptly even
     // if an inherited FD outlives the group kill (else the for-await would hang on a survivor).
     if (timedOut) {
@@ -283,6 +485,9 @@ export async function* nodeLineStream(
       child.stderr?.destroy();
     }
     settle(code);
+  });
+  child.on('close', () => {
+    handleState.settled = true;
   });
   // Surface a spawn failure (ENOENT) as a stdout stream error → the for-await below throws.
   child.on('error', (e) => {
@@ -315,6 +520,11 @@ export async function* nodeLineStream(
   }
 
   const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+  // A second 'data' listener only records WHEN output arrived; readline still reads every chunk.
+  child.stdout.on('data', () => {
+    handleState.lastOutputAt = Date.now();
+  });
+  reportSpawn(req, child, handleState, leaderExit);
   try {
     for await (const line of rl) {
       yield line;
@@ -333,6 +543,7 @@ export async function* nodeLineStream(
       killProcessGroup(child, 'SIGKILL');
       await exited; // SIGKILL guarantees an 'exit' → settle resolves this
     }
+    handleState.settled = true;
     onEnd?.({ timedOut, exitCode, stderrTail });
   }
 }

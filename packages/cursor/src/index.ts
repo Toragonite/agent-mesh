@@ -7,11 +7,15 @@
  * user-runtime quota read of the current billing period. Unofficial.
  */
 export { CursorAdapter, createChat, type CursorAdapterOptions, type CreateChatOptions } from './adapter.js';
-export { nodeExec, nodeLineStream } from './exec.js';
+// Process seams, plus the 0.1.3 helpers: the leader-only interrupt ladder and a
+// run-to-completion over any line seam.
+export { nodeExec, nodeLineStream, interruptLadder, execOverLineStream } from './exec.js';
 export type {
   ExecFn,
   ExecRequest,
   ExecResult,
   LineStreamFn,
   StreamEndMeta,
+  SpawnedProcess,
+  InterruptLadderStages,
 } from './exec.js';

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.3
+
+The turn lane. Measured on agy 1.3.6.
+
+- **`resumeId` → `--conversation <id>`** on `run()` and `stream()`; `--mode` is passed again on
+  every turn and the prompt always directly follows `-p`. No `--print-timeout` is passed (print
+  mode waits for the turn by default).
+- **`elevated: true` → `--dangerously-skip-permissions`**, never added otherwise. agy print mode
+  calls MCP tools only under this flag (it also approves every shell command): the caller writes
+  `<cwd>/.agents/mcp_config.json`, and an `mcp` attachment without `elevated` adds a note saying its
+  tools will not be called.
+- **`session` event** from `init`'s `conversation_id` (and from a step's or the terminal payload's
+  when it differs). For an unknown id agy prints `warning: conversation "…" not found` and SILENTLY
+  starts a new conversation: the `session` id then differs from `resumeId`. With no id reported,
+  the result falls back to `resumeId`, as `resume()` does.
+- **One terminal event:** lines after the terminal payload are drained but emit nothing; no `error`
+  after `done`.
+- **`RunOptions`:** `lineStream` is the only seam the run spawns through; `env` is the child's whole
+  environment, used verbatim (no `AGY_HOME` of the adapter's own; an explicit `account.configDir`
+  it displaces is noted).
+- `appendSystemPromptFile`: no agy flag — the content is prefixed to the `-p` value, with a note,
+  read through the new `readTextFile` constructor seam. `sessionId`, `disallowedTools`,
+  `settingSources` and `mcp.projectConfigFile` are ignored with a note; `unattended` needs nothing.
+  Invalid turn-lane fields throw before anything is spawned.
+- `interactiveResume()` returns `undefined` (no interactive take-over in this release).
+- **Process seam:** `ExecRequest.onSpawn` / `SpawnedProcess`, `interruptLadder()` and
+  `execOverLineStream()`, exported from the entry.
+
+All five packages move in lockstep (0.1.2 was never published to npm); this package now depends on
+`@toragonite/agent-mesh@^0.1.3`.
+
 ## 0.1.2
 
 `quota()` now reports Antigravity usage (it returned `null` by design), and

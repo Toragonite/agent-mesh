@@ -2,8 +2,8 @@
 
 The **Codex (OpenAI)** adapter for [agent-mesh](https://www.npmjs.com/package/@toragonite/agent-mesh).
 It drives the official `codex` CLI headlessly behind the vendor-neutral `Adapter`
-contract: one-shot runs, resume-by-conversation-id, auth-gated model
-introspection, and a quota read.
+contract: one-shot runs, resume-by-conversation-id, incremental streaming (since
+0.1.3), auth-gated model introspection, and a quota read.
 
 > **Unofficial.** Not affiliated with or endorsed by OpenAI. It drives the
 > vendor's own official CLI under your own login — no credential sharing, no
@@ -34,11 +34,53 @@ const more = await fleet.resume('codex', result.conversationId, 'Now list the ri
 console.log(more.text);
 ```
 
-`new CodexAdapter(opts?)` accepts injectable seams (`exec`, `binary`,
+`new CodexAdapter(opts?)` accepts injectable seams (`exec`, `lineStream`, `binary`,
 `defaultAccount`, `readTextFile`, `fetchFn`, `env`), each with a real default,
-plus `quotaTimeoutMs` (default `10000`) bounding the quota fetch, and
+plus `quotaTimeoutMs` (default `10000`) bounding the quota fetch,
 `modelsTimeoutMs` (default `15000`) / `modelsCacheMs` (default `60000`) for the
-live model listing (see [Models](#auth-gated-models)).
+live model listing (see [Models](#auth-gated-models)), and `skipGitRepoCheck`
+(default `false`; see [Turns](#turns-stream-resume-mcp-since-013)).
+
+### Turns: stream, resume, MCP (since 0.1.3)
+
+`stream()` reads `codex exec --json` line by line (`capabilities.stream` is `true`):
+a `session` event with the thread id (`thread.started`), one `tool` event per tool-ish
+item (`command_execution`, `file_change`, an MCP call as `mcp__<server>__<tool>`, …),
+a `text` event per completed agent message, then `usage` and exactly one `done` — the
+same `RunResult` `run()` maps from the same output — or one `error` where `run()` would
+throw. The `session` id is the CLI's own report, never `resumeId` echoed back.
+
+`run()` and `stream()` take the turn-lane fields of `RunTask` (measured on codex-cli
+0.162.1):
+
+- **`resumeId`** → `codex exec resume <id> --json --model <m> … -- <prompt>`. A resume
+  REQUIRES a model: without one `codex exec resume` runs the model named in
+  `config.toml`, which may no longer exist — so `resumeId` without `model` throws
+  `Codex resume needs a model (-m): …` before anything is spawned. `exec resume` takes no
+  `--sandbox`: `permissionMode` becomes `-c sandbox_mode="<mode>"` (the thread's sandbox
+  carries over; the override restates it). When the output reports no thread id, the
+  result falls back to `resumeId`, as `resume()` does.
+- **`mcp`** → three per-run overrides, spelled as TOML strings:
+  `-c mcp_servers.<name>.command="…"`, `-c mcp_servers.<name>.args=["…","…"]` and
+  `-c mcp_servers.<name>.default_tools_approval_mode="approve"` — without the approval mode
+  every MCP call is refused under the exec approval policy. No `env` table is written: codex
+  starts an MCP server with a filtered environment, so give the server its identity in `args`.
+- **`appendSystemPromptFile`** — codex has no system-prompt flag: the file's content is
+  prefixed to the prompt, with a note. `sessionId`, `disallowedTools`, `settingSources`,
+  `elevated` and `mcp.projectConfigFile` are ignored with a note; `unattended` needs nothing
+  (exec never prompts).
+- **`RunOptions`** — `lineStream` is the only seam the run spawns through; `env` is the child's
+  whole environment, used verbatim (no `CODEX_HOME` of the adapter's own), and the model gate
+  then reads the login of THAT environment's `CODEX_HOME` / `OPENAI_API_KEY`; `skipAuthCheck`
+  skips the login read entirely (only the off-catalog note remains).
+- **`skipGitRepoCheck: true`** (constructor) adds `--skip-git-repo-check` to every run that
+  starts a thread, never to a resume.
+- `interactiveResume()` returns `undefined`: no interactive take-over in this release.
+
+The process seam exports `interruptLadder(proc)` — SIGINT to the CLI process only (a SIGINT
+sent to the whole process group does not stop a codex turn), then SIGTERM and SIGKILL to the
+group — for the `SpawnedProcess` handle `ExecRequest.onSpawn` reports, and
+`execOverLineStream(lineStream, req)`.
 
 ### Resuming in a working directory
 

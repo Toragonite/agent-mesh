@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.3
+
+`stream()` and the turn lane. Measured on codex-cli 0.162.1.
+
+- **`stream()`** over `codex exec --json`; `capabilities.stream` is now `true`. Events: `session`
+  (the `thread.started` id — the CLI's own report, never `resumeId` echoed back), one `tool` per
+  tool-ish item (`command_execution`, `file_change`, an MCP call as `mcp__<server>__<tool>`, …;
+  reasoning items emit nothing), `text` per completed agent message, then `usage` and exactly one
+  `done` carrying the same `RunResult` `run()` maps from the same output — or one `error` where
+  `run()` would throw (a spawn failure; a non-zero exit with nothing parsed, with its stderr
+  tail). New `lineStream` constructor seam (default: the real line streamer). Internally the JSONL
+  parser now reads one line at a time; `run()`'s mapping is unchanged.
+- **Resumed turns:** `resumeId` → `codex exec resume <id> --json --model <m> … -- <prompt>`. A
+  resume REQUIRES a model — without one, `codex exec resume` runs the model named in
+  `config.toml`, which may no longer exist — so `resumeId` without `model` throws
+  `Codex resume needs a model (-m): …` before anything is spawned. `exec resume` takes no
+  `--sandbox`: `permissionMode` becomes `-c sandbox_mode="<mode>"` (the thread's sandbox carries
+  over). With no thread id in the output the result falls back to `resumeId`, as `resume()`
+  always has. `resume()` itself is unchanged.
+- **MCP:** `mcp` → `-c mcp_servers.<name>.command="…"`, `-c mcp_servers.<name>.args=[…]` and
+  `-c mcp_servers.<name>.default_tools_approval_mode="approve"`, spelled as TOML strings
+  (backslashes and quotes escaped; control characters refused). Without the approval mode every MCP
+  call is refused under the exec approval policy. No `env` table: a codex MCP child gets a filtered
+  environment, so the server's identity travels in `args`.
+- **`RunOptions`:** `lineStream` is the only seam the run spawns through; `env` is the child's whole
+  environment, used verbatim (no `CODEX_HOME` of the adapter's own), and the model gate then reads
+  the login of that environment's `CODEX_HOME` / `OPENAI_API_KEY`; `skipAuthCheck` skips the login
+  read (only the off-catalog note remains).
+- `appendSystemPromptFile`: codex has no system-prompt flag — the file's content is prefixed to the
+  prompt, with a note (an unreadable file, or one over 256 KiB, is refused). `sessionId`,
+  `disallowedTools`, `settingSources`, `elevated` and `mcp.projectConfigFile` are ignored with a
+  note; `unattended` needs nothing.
+- New constructor option `skipGitRepoCheck` (default `false`): `--skip-git-repo-check` on every
+  run that starts a thread, never on a resume.
+- `interactiveResume()` returns `undefined` (no interactive take-over in this release).
+- **Process seam:** `ExecRequest.onSpawn` / `SpawnedProcess`, `interruptLadder()` (SIGINT to the CLI
+  process only — a group SIGINT does not stop a codex turn — then SIGTERM and SIGKILL to the group)
+  and `execOverLineStream()`, exported from the entry.
+
+All five packages move in lockstep (0.1.2 was never published to npm); this package now depends on
+`@toragonite/agent-mesh@^0.1.3`.
+
 ## 0.1.2
 
 `quota()` reads the live usage body again. It had returned `null` for every account.
