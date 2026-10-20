@@ -11,13 +11,13 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Account } from '@toragonite/agent-mesh';
 import { GeminiAdapter, type GeminiAdapterOptions } from '../src/adapter.js';
 import { nodeExec, type ExecFn, type ExecRequest, type ExecResult } from '../src/exec.js';
-import { ensurePrivateDir, MAX_USAGE_STDOUT_BYTES, usageCwd } from '../src/quota.js';
+import { ensurePrivateDir, MAX_USAGE_STDOUT_BYTES, USAGE_DIR_NAME, usageCwd, usageDirName } from '../src/quota.js';
 import { recordingExec, jsonl } from './helpers.js';
 
 // Most tests here drive a FAKE `agy`: a small node script written to a temp dir and
@@ -251,13 +251,13 @@ describe('quota() capability and seam', () => {
     expect(calls[0]).toEqual({
       cmd: '/opt/agy/bin/agy',
       args: ['-p', '/usage', '--output-format', 'json'],
-      cwd: join(tmpdir(), 'agent-mesh-agy-usage'),
+      cwd: join(tmpdir(), usageDirName()),
       env: {},
       timeoutMs: 90_000,
       ignoreStdin: true,
       maxStdoutBytes: 1_048_576,
     });
-    expect(usageCwd()).toBe(join(tmpdir(), 'agent-mesh-agy-usage'));
+    expect(usageCwd()).toBe(join(tmpdir(), usageDirName()));
   });
 
   it('no module on the quota path imports child_process — the seam is the only spawner', () => {
@@ -390,11 +390,11 @@ describe.skipIf(process.platform === 'win32')('the private working directory', (
     expect(await ensurePrivateDir(file)).toBe(false);
   });
 
-  it('quota() refuses to start agy when the fixed path is not private, and spawns nothing', async () => {
+  it('quota() refuses to start agy when the per-user path is not private, and spawns nothing', async () => {
     const b = base();
     const target = join(b, 'elsewhere');
     mkdirSync(target, { mode: 0o700 });
-    symlinkSync(target, join(b, 'agent-mesh-agy-usage'));
+    symlinkSync(target, join(b, usageDirName()));
     const saved = process.env.TMPDIR;
     process.env.TMPDIR = b; // os.tmpdir() reads it at call time
     try {
@@ -406,6 +406,104 @@ describe.skipIf(process.platform === 'win32')('the private working directory', (
       else process.env.TMPDIR = saved;
     }
   });
+});
+
+/* ------------------------------------------------------------------------- *
+ * The per-user directory name (0.1.4)
+ * ------------------------------------------------------------------------- */
+
+/** Run `fn` with os.tmpdir() pointing at `dir` (it reads TMPDIR at call time). */
+async function withTmpdir<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = dir;
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
+}
+
+describe('the per-user usage directory name (0.1.4)', () => {
+  it('keeps USAGE_DIR_NAME as the prefix', () => {
+    expect(USAGE_DIR_NAME).toBe('agent-mesh-agy-usage');
+    expect(usageDirName().startsWith(`${USAGE_DIR_NAME}-`)).toBe(true);
+    expect(usageCwd()).toBe(join(tmpdir(), usageDirName()));
+  });
+
+  it.skipIf(typeof process.getuid !== 'function')('is agent-mesh-agy-usage-<uid> where process.getuid exists', () => {
+    expect(usageDirName()).toBe(`agent-mesh-agy-usage-${process.getuid!()}`);
+    const spy = vi.spyOn(process as { getuid: () => number }, 'getuid').mockReturnValue(4242);
+    try {
+      expect(usageDirName()).toBe('agent-mesh-agy-usage-4242');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('without process.getuid: a sanitized username — one path component, never blank', () => {
+    const saved = Object.getOwnPropertyDescriptor(process, 'getuid');
+    Object.defineProperty(process, 'getuid', { value: undefined, configurable: true, writable: true });
+    try {
+      const name = usageDirName();
+      expect(name).toMatch(/^agent-mesh-agy-usage-[A-Za-z0-9._-]{1,64}$/);
+      expect(name).not.toMatch(/-\.+$/);
+      // The OS username (when it is already safe) is used verbatim.
+      let username = '';
+      try {
+        username = userInfo().username;
+      } catch {
+        username = '';
+      }
+      if (/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/.test(username)) {
+        expect(name).toBe(`agent-mesh-agy-usage-${username}`);
+      }
+    } finally {
+      if (saved) Object.defineProperty(process, 'getuid', saved);
+      else delete (process as { getuid?: unknown }).getuid;
+    }
+    expect(typeof process.getuid).toBe(saved ? typeof saved.value : 'undefined');
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    "another user's directory at the shared name no longer blocks the read; a foreign one at OUR name still refuses",
+    async () => {
+      const b = mkdtempSync(join(tmpdir(), 'agent-mesh-peruser-'));
+      dirs.push(b);
+      // The pre-0.1.4 shared name, taken by "someone else": a symlink we must never follow.
+      const elsewhere = join(b, 'elsewhere');
+      mkdirSync(elsewhere, { mode: 0o700 });
+      symlinkSync(elsewhere, join(b, USAGE_DIR_NAME));
+      await withTmpdir(b, async () => {
+        const { exec, calls } = recordingExec({ stdout: LIVE_STDOUT });
+        const snap = await new GeminiAdapter({ exec, env: {}, quotaCacheMs: 0 }).quota();
+        expect(snap).not.toBeNull();
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.cwd).toBe(join(b, usageDirName()));
+        expect(statSync(join(b, usageDirName())).mode & 0o777).toBe(0o700);
+      });
+
+      // Simulate a directory at OUR per-user name that is owned by someone else: the uid the
+      // process reports is not the directory's owner. It is refused, and nothing spawns.
+      const c = mkdtempSync(join(tmpdir(), 'agent-mesh-peruser-'));
+      dirs.push(c);
+      const realUid = process.getuid!();
+      const otherUid = realUid + 1;
+      const spy = vi.spyOn(process as { getuid: () => number }, 'getuid').mockReturnValue(otherUid);
+      try {
+        expect(usageDirName()).toBe(`agent-mesh-agy-usage-${otherUid}`);
+        mkdirSync(join(c, usageDirName()), { mode: 0o700 }); // owned by realUid, not "us"
+        expect(await ensurePrivateDir(join(c, usageDirName()))).toBe(false);
+        await withTmpdir(c, async () => {
+          const { exec, calls } = recordingExec({ stdout: LIVE_STDOUT });
+          await expect(new GeminiAdapter({ exec, env: {}, quotaCacheMs: 0 }).quota()).resolves.toBeNull();
+          expect(calls).toHaveLength(0);
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
 });
 
 /* ------------------------------------------------------------------------- *
@@ -684,11 +782,13 @@ process.exitCode = 0;`;
 const gc = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });
 log({ kind: 'grandchild', pid: gc.pid });
 setInterval(() => {}, 1000);`);
-    const { adapter, calls } = adapterFor(fake.bin, { quotaTimeoutMs: 800 });
+    // A budget a loaded machine cannot outrun: the fake (and its grandchild) must have started
+    // before the deadline kills the group, or there is nothing to assert about.
+    const { adapter, calls } = adapterFor(fake.bin, { quotaTimeoutMs: 3_000 });
     const start = Date.now();
     expect(await adapter.quota()).toBeNull();
-    expect(Date.now() - start).toBeLessThan(8_000);
-    expect(calls[0]!.timeoutMs).toBe(800);
+    expect(Date.now() - start).toBeLessThan(12_000);
+    expect(calls[0]!.timeoutMs).toBe(3_000);
     const pid = fake.starts()[0]!.pid as number;
     const grandchild = fake.events().find((e) => e.kind === 'grandchild')?.pid as number | undefined;
     expect(grandchild).toBeTypeOf('number');

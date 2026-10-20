@@ -34,6 +34,7 @@ npm install @toragonite/agent-mesh @toragonite/agent-mesh-codex
 | `quotaTimeoutMs` | `number` | `10000` | 쿼터 조회의 최대 대기 시간. |
 | `modelsTimeoutMs` | `number` | `15000` | `codex app-server` 모델 목록 조회의 최대 대기 시간. 넘기면 프로세스 그룹을 종료합니다. |
 | `modelsCacheMs` | `number` | `60000` | 조회에 실패한 뒤 CLI에 다시 묻기 전까지 정적 카탈로그를 돌려주는 시간. |
+| `spawn` | `SpawnFn` | `child_process.spawn` | `codex app-server` 모델 목록 조회용 프로세스 생성 seam(0.1.4부터). 기본값이면 실패나 타임아웃 때 app-server의 프로세스 그룹을 종료하고, 주입한 spawner의 자식은 그 자식만 종료합니다. |
 
 ## 실행과 재개
 
@@ -93,6 +94,14 @@ console.log(more.text)
 import { fetchLiveModels } from '@toragonite/agent-mesh-codex'
 const live = await fetchLiveModels({ codexHome: '/path/to/codex-home' }) // 실패하면 []
 ```
+
+이 조회는 `exec`가 시작하지 않는 유일한 프로세스라서 별도의 seam이 있습니다(0.1.4부터):
+어댑터 옵션과 `fetchLiveModels()` 옵션의 `spawn`이며, 타입은 `SpawnFn` —
+`child_process.spawn`의 모양이고 그것이 기본값입니다. `spawn(binary, ['app-server'], options)`로
+한 번 호출되며, `stdin`/`stdout`/`stderr` 파이프가 있는 자식(`SpawnedChild`)을 돌려줘야
+합니다. 호스트의 밀폐 테스트는 메모리 안의 가짜로 프로토콜에 답할 수 있습니다. 주입한
+자식은 실패나 타임아웃 때 `child.kill('SIGKILL')`로 종료되며, 프로세스 그룹 단위로는 결코
+종료되지 않습니다.
 
 두 목록 모두 같은 방식으로 게이팅됩니다. ChatGPT 로그인에서는 범용 모델만 선택할
 수 있고, `gpt-5.1-codex-max`와 `gpt-5.2`는 API 키가 필요합니다. 로그아웃

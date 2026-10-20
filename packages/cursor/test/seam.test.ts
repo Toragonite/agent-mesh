@@ -37,7 +37,7 @@ describe.skipIf(!posix)('leader SIGINT through onSpawn + interruptLadder (real n
     let proc: SpawnedProcess | undefined;
     let end: StreamEndMeta | undefined;
     const seen: string[] = [];
-    const start = Date.now();
+    let interruptedAt = 0;
     for await (const line of nodeLineStream(
       {
         cmd: process.execPath,
@@ -52,12 +52,17 @@ describe.skipIf(!posix)('leader SIGINT through onSpawn + interruptLadder (real n
       },
     )) {
       seen.push(line);
-      if (line === 'ready') interruptLadder(proc!, { termAfterMs: 5_000, killAfterMs: 2_000 });
+      if (line === 'ready') {
+        interruptedAt = Date.now();
+        interruptLadder(proc!, { termAfterMs: 5_000, killAfterMs: 2_000 });
+      }
     }
     expect(proc!.pid).toBeGreaterThan(0);
     expect(seen).toEqual(['ready', 'interrupted']);
     expect(end?.exitCode).toBe(130);
-    expect(Date.now() - start).toBeLessThan(5_000); // the SIGINT did it, not the SIGTERM stage
+    // The SIGINT did it, not the SIGTERM stage: the exit came before termAfterMs. Timed from the
+    // interrupt, not the spawn, so a slow node start-up on a loaded machine cannot flake it.
+    expect(Date.now() - interruptedAt).toBeLessThan(5_000);
     expect(proc!.hasExited()).toBe(true);
     await expect(proc!.exited).resolves.toBe(130);
     // Its pid may belong to another process by now: the handle refuses to signal it.

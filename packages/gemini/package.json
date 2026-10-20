@@ -1,6 +1,6 @@
 {
   "name": "@toragonite/agent-mesh-gemini",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Google Antigravity adapter for agent-mesh — drive the official agy CLI headlessly: run, resume, stream, static/live models. Unofficial.",
   "keywords": ["ai","agent","orchestration","gemini","antigravity","agy","google","llm","cli","agent-mesh"],
   "license": "MIT",
@@ -29,6 +29,6 @@
     "prepublishOnly": "tsup"
   },
   "dependencies": {
-    "@toragonite/agent-mesh": "^0.1.3"
+    "@toragonite/agent-mesh": "^0.1.4"
   }
 }

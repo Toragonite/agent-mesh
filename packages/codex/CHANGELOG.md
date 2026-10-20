@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.4
+
+- **Injectable spawner for the model listing:** the `codex app-server` session behind
+  `availableModels()` used to start its process with `child_process.spawn` directly — the one
+  process this adapter started outside a seam, so a host could not stub (or track) it. New
+  optional `spawn` on `CodexAdapterOptions` and on `fetchLiveModels()` options, typed `SpawnFn`
+  (the shape of `child_process.spawn`, which is the default) and returning a `SpawnedChild` (the
+  part of a `ChildProcess` the listing uses). It is called once as
+  `spawn(<binary>, ['app-server'], { env, shell: false, detached: true, stdio: 'pipe'×3 })`. With
+  the default, a failure or the deadline still kills the app-server's whole process group; with
+  an injected spawner, only the child it returned is killed (`child.kill('SIGKILL')`). A spawner
+  that throws, or returns a child without its pipes, yields the static list like any other failure.
+- Tests: the timeout tests of the live model listing use multi-second budgets, so a loaded
+  machine no longer flakes them.
+
 ## 0.1.3
 
 `stream()` and the turn lane. Measured on codex-cli 0.162.1.

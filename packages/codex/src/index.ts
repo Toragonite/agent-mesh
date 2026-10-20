@@ -8,6 +8,8 @@
  */
 export { CodexAdapter, type CodexAdapterOptions } from './adapter.js';
 export { fetchLiveModels, type FetchLiveModelsOptions, STATIC_MODELS } from './models.js';
+// The `codex app-server` spawn seam (since 0.1.4): `CodexAdapterOptions.spawn` / `FetchLiveModelsOptions.spawn`.
+export type { SpawnFn, SpawnedChild } from './app-server.js';
 // Process seams (duplicated-by-design across adapters), plus the 0.1.3 helpers: the
 // leader-only interrupt ladder and a run-to-completion over any line seam.
 export {

@@ -18,9 +18,32 @@
  * — resolves `null` after the whole process group is killed and gone (bounded), so
  * nothing is left running and the caller never hangs. This module never throws.
  */
-import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { spawn as nodeSpawn, type SpawnOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { buildEnv, killProcessGroup } from './exec.js';
+
+/**
+ * What a {@link SpawnFn} returns: the part of a `ChildProcess` the listing uses. A real
+ * `ChildProcess` satisfies it; a test fake needs only these members. The listing spawns with
+ * `stdio: ['pipe','pipe','pipe']`, so all three streams must be present — a child with a missing
+ * stream counts as a failed listing.
+ */
+export interface SpawnedChild {
+  readonly pid?: number;
+  readonly stdin: Writable | null;
+  readonly stdout: Readable | null;
+  readonly stderr: Readable | null;
+  kill(signal?: NodeJS.Signals | number): boolean;
+  on(event: 'error', listener: (err: Error) => void): unknown;
+  on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+}
+
+/**
+ * The process-spawn seam for the `codex app-server` model listing (since 0.1.4) — the shape of
+ * `child_process.spawn(command, args, options)`, which is assignable to it. Called once per
+ * listing as `spawn(<binary>, ['app-server'], { env, shell: false, detached: true, stdio: 'pipe'×3 })`.
+ */
+export type SpawnFn = (command: string, args: string[], options: SpawnOptions) => SpawnedChild;
 
 export interface AppServerRequest {
   /** The codex binary (name or path). Spawned as `<cmd> app-server`, `shell:false`. */
@@ -31,6 +54,12 @@ export interface AppServerRequest {
   timeoutMs: number;
   /** `clientInfo.version` sent in `initialize`. */
   clientVersion: string;
+  /**
+   * Spawn seam (since 0.1.4). Omitted = `child_process.spawn`, and a failure or the deadline
+   * kills the app-server's whole process group. When given, a kill goes ONLY to the child it
+   * returned (`child.kill('SIGKILL')`) — never to a process group the seam may not own.
+   */
+  spawn?: SpawnFn;
 }
 
 /** At most this many `model/list` pages are requested. */
@@ -54,19 +83,51 @@ function isRecord(x: unknown): x is Record<string, unknown> {
  */
 export function listAppServerModels(req: AppServerRequest): Promise<unknown[] | null> {
   return new Promise<unknown[] | null>((resolve) => {
-    let child: ChildProcessByStdio<Writable, Readable, Readable>;
+    const injected = req.spawn !== undefined;
+    let child: SpawnedChild;
     try {
-      child = spawn(req.cmd, ['app-server'], {
+      const spawnFn: SpawnFn = req.spawn ?? nodeSpawn;
+      child = spawnFn(req.cmd, ['app-server'], {
         env: buildEnv(req.env),
         shell: false,
         // Own process group, so a kill reaps whatever the app-server spawned too.
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
-      }) as ChildProcessByStdio<Writable, Readable, Readable>;
+      });
     } catch {
       resolve(null);
       return;
     }
+    // The default spawner's child leads its own group: kill the group. An injected spawner's
+    // child is killed by itself only — its pid may not be a group leader we started.
+    const killChild = (): void => {
+      if (!injected) {
+        killProcessGroup(child, 'SIGKILL');
+        return;
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    };
+    if (
+      typeof child !== 'object' ||
+      child === null ||
+      typeof child.on !== 'function' ||
+      typeof child.kill !== 'function' ||
+      !child.stdin ||
+      !child.stdout ||
+      !child.stderr
+    ) {
+      // Not a usable child (an injected seam's mistake, or no pipes): stop it if we can, give up.
+      if (typeof child === 'object' && child !== null && typeof child.kill === 'function') killChild();
+      resolve(null);
+      return;
+    }
+    const stdin: Writable = child.stdin;
+    const stdout: Readable = child.stdout;
+    const stderr: Readable = child.stderr;
 
     const entries: unknown[] = [];
     let settled = false;
@@ -96,7 +157,7 @@ export function listAppServerModels(req: AppServerRequest): Promise<unknown[] | 
         settle(null);
         return;
       }
-      killProcessGroup(child, 'SIGKILL');
+      killChild();
       const cap = setTimeout(() => settle(null), EXIT_WAIT_MS);
       cap.unref?.();
     };
@@ -106,7 +167,7 @@ export function listAppServerModels(req: AppServerRequest): Promise<unknown[] | 
 
     const send = (message: Record<string, unknown>): void => {
       try {
-        child.stdin.write(`${JSON.stringify(message)}\n`);
+        stdin.write(`${JSON.stringify(message)}\n`);
       } catch {
         fail();
       }
@@ -120,7 +181,7 @@ export function listAppServerModels(req: AppServerRequest): Promise<unknown[] | 
     const endSession = (): void => {
       answered = true;
       try {
-        child.stdin.end();
+        stdin.end();
       } catch {
         fail();
       }
@@ -178,46 +239,54 @@ export function listAppServerModels(req: AppServerRequest): Promise<unknown[] | 
       endSession();
     };
 
-    child.stdin.on('error', () => {
-      /* EPIPE once the child is gone — the exit/deadline path owns the outcome */
-    });
-    child.stderr.on('data', () => {
-      /* drained so a chatty child can never fill the pipe and wedge */
-    });
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      if (settled || failing || answered) return; // keep draining, stop interpreting
-      stdoutChars += chunk.length;
-      if (stdoutChars > MAX_STDOUT_CHARS) {
-        fail();
-        return;
-      }
-      buffer += chunk;
-      let newline = buffer.indexOf('\n');
-      while (newline !== -1) {
-        const line = buffer.slice(0, newline).replace(/\r$/, '');
-        buffer = buffer.slice(newline + 1);
-        handleLine(line);
-        if (settled || failing || answered) return;
-        newline = buffer.indexOf('\n');
-      }
-      if (buffer.length > MAX_LINE_CHARS) fail();
-    });
+    try {
+      stdin.on('error', () => {
+        /* EPIPE once the child is gone — the exit/deadline path owns the outcome */
+      });
+      stderr.on('data', () => {
+        /* drained so a chatty child can never fill the pipe and wedge */
+      });
+      stdout.setEncoding('utf8');
+      stdout.on('data', (chunk: string) => {
+        if (settled || failing || answered) return; // keep draining, stop interpreting
+        stdoutChars += chunk.length;
+        if (stdoutChars > MAX_STDOUT_CHARS) {
+          fail();
+          return;
+        }
+        buffer += chunk;
+        let newline = buffer.indexOf('\n');
+        while (newline !== -1) {
+          const line = buffer.slice(0, newline).replace(/\r$/, '');
+          buffer = buffer.slice(newline + 1);
+          handleLine(line);
+          if (settled || failing || answered) return;
+          newline = buffer.indexOf('\n');
+        }
+        if (buffer.length > MAX_LINE_CHARS) fail();
+      });
 
-    child.on('error', () => {
-      // A spawn failure (ENOENT, EACCES) — or a signal we could not send. Make sure
-      // nothing keeps running, then settle; no 'exit' may follow a failed spawn.
-      if (!exited) killProcessGroup(child, 'SIGKILL');
+      child.on('error', () => {
+        // A spawn failure (ENOENT, EACCES) — or a signal we could not send. Make sure
+        // nothing keeps running, then settle; no 'exit' may follow a failed spawn.
+        if (!exited) killChild();
+        settle(null);
+      });
+      child.on('exit', (code, signal) => {
+        exited = true;
+        if (!failing && answered && code === 0 && signal === null) {
+          settle(entries);
+          return;
+        }
+        settle(null); // killed, or exited early / non-zero: not a usable answer
+      });
+    } catch {
+      // A child whose streams or events cannot be wired (an injected seam's fake, say): this
+      // module never rejects, so stop it and resolve null.
+      killChild();
       settle(null);
-    });
-    child.on('exit', (code, signal) => {
-      exited = true;
-      if (!failing && answered && code === 0 && signal === null) {
-        settle(entries);
-        return;
-      }
-      settle(null); // killed, or exited early / non-zero: not a usable answer
-    });
+      return;
+    }
 
     send({
       id: 1,

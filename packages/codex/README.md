@@ -37,8 +37,8 @@ console.log(more.text);
 `new CodexAdapter(opts?)` accepts injectable seams (`exec`, `lineStream`, `binary`,
 `defaultAccount`, `readTextFile`, `fetchFn`, `env`), each with a real default,
 plus `quotaTimeoutMs` (default `10000`) bounding the quota fetch,
-`modelsTimeoutMs` (default `15000`) / `modelsCacheMs` (default `60000`) for the
-live model listing (see [Models](#auth-gated-models)), and `skipGitRepoCheck`
+`modelsTimeoutMs` (default `15000`) / `modelsCacheMs` (default `60000`) and the
+`spawn` seam (since 0.1.4) for the live model listing (see [Models](#auth-gated-models)), and `skipGitRepoCheck`
 (default `false`; see [Turns](#turns-stream-resume-mcp-since-013)).
 
 ### Turns: stream, resume, MCP (since 0.1.3)
@@ -128,6 +128,14 @@ early or non-zero exit, the deadline — `availableModels()` returns the static
 catalog below instead. It never throws and never hangs. `fetchLiveModels()` is the
 same listing on its own: it returns `[]` on any failure, so you can tell a live
 answer from the fallback.
+
+The listing is the one process `exec` does not start, so since 0.1.4 it has its own
+seam: `spawn` (on the adapter options and on `fetchLiveModels()`'s), typed `SpawnFn` —
+the shape of `child_process.spawn`, which is the default. It is called once as
+`spawn(binary, ['app-server'], options)` and returns a `SpawnedChild` (a child with
+its three pipes), so hermetic tests can answer the protocol from an in-memory fake.
+With the default, a failure or the deadline kills the app-server's process group; an
+injected spawner's child is killed by itself only (`child.kill('SIGKILL')`).
 
 ```ts
 import { fetchLiveModels } from '@toragonite/agent-mesh-codex';

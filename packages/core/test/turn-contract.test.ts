@@ -5,8 +5,10 @@ import {
   type InteractiveResumeSpec,
   type LineStreamFn,
   type McpAttachment,
+  type McpServerStatus,
   type RunEvent,
   type RunOptions,
+  type RunResult,
   type RunTask,
 } from '../src/index.js';
 import { makeAdapter, okResult } from './helpers.js';
@@ -83,5 +85,18 @@ describe('0.1.3 contract additions are additive', () => {
     };
     expect(task.mcp?.name).toBe('team');
     expect(spec.args).toEqual(['--resume', 'r-1']);
+  });
+});
+
+describe('0.1.4 contract additions are additive', () => {
+  it('a session event and a RunResult without mcpServers are still valid; with it they narrow', () => {
+    const servers: McpServerStatus[] = [{ name: 'team', status: 'connected' }];
+    const legacy: RunEvent = { type: 'session', conversationId: 'abc' };
+    const withServers: RunEvent = { type: 'session', conversationId: 'abc', mcpServers: servers };
+    const result: RunResult = { vendor: 'claude', conversationId: 'abc', text: '', status: 'ok', mcpServers: servers };
+    const statusOf = (e: RunEvent) => (e.type === 'session' ? e.mcpServers?.map((s) => s.status) : undefined);
+    expect(statusOf(legacy)).toBeUndefined();
+    expect(statusOf(withServers)).toEqual(['connected']);
+    expect(result.mcpServers?.[0]?.name).toBe('team');
   });
 });

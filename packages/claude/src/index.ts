@@ -12,6 +12,8 @@
 
 // The Adapter implementation + its constructor seams.
 export { ClaudeAdapter } from './adapter';
+// Since 0.1.4: the validated `mcp_servers` of a stream-json `system/init` line (also on stream()'s events).
+export { parseInitMcpServers } from './adapter';
 export type { ClaudeAdapterOptions } from './adapter';
 
 // Process seams (duplicated-by-design across adapters), plus the 0.1.3 helpers: the

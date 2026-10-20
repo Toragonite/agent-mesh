@@ -195,9 +195,11 @@ const snap = await new GeminiAdapter().quota()
   결과(스냅샷 또는 `null`)는 **60초** 동안 캐시됩니다(`quotaCacheMs`, `0`이면
   캐시 끔). 어댑터 인스턴스·계정별로 읽기는 동시에 **하나**만 실행되며, 동시에
   호출한 쪽은 그 결과를 기다립니다. 자식 프로세스는 `run()`과 같은 계정 env,
-  `/dev/null` stdin, 비공개 작업 디렉터리(`<os tmpdir>/agent-mesh-agy-usage`,
-  `0700`으로 생성되며 비공개가 아니면 거부)로 어댑터의 `exec` 시임을 통해
-  시작됩니다.
+  `/dev/null` stdin, 사용자별 비공개 작업 디렉터리(`<os tmpdir>/agent-mesh-agy-usage-<uid>`,
+  uid가 없는 플랫폼에서는 정리된 `-<username>`; 0.1.4부터 — 이전에는 모든 로컬 사용자가
+  한 이름을 공유)로 어댑터의 `exec` 시임을 통해 시작됩니다. 디렉터리는 `0700`으로
+  만들어지며, 이 사용자 소유의 실제 디렉터리이고 모드가 `0700`이 아니면 거부됩니다(읽기는
+  `null`, 아무것도 실행하지 않음).
 
 ::: warning 계정 격리는 제공되지 않습니다
 `agy` 1.3.5는 `AGY_HOME`을 읽지 않으므로, `quota()`가 보고하는 계정을 포함해

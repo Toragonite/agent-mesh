@@ -3,6 +3,23 @@
 All notable changes to **@toragonite/agent-mesh** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.4
+
+One additive type change; no runtime changes.
+
+- **`McpServerStatus`** — `{ name: string; status: string }`: one MCP server's connection state
+  as the vendor's own stream reported it at the start of a run. `status` is the vendor's word
+  (Claude Code: `connected`, `failed`, `needs-auth`, `pending`, …); treat an unknown one as "not
+  known to be connected".
+- **`RunEvent` `session` gains `mcpServers?: ReadonlyArray<McpServerStatus>`**, and
+  **`RunResult` gains `mcpServers?`** (on a streamed run's `done` result). Both optional: absent
+  means "not reported", and adapters that never set them are unaffected. The Claude adapter fills
+  them from Claude Code's `system/init` line.
+
+This release also carries a Codex spawn seam for the model listing and an Antigravity usage-read
+fix (`@toragonite/agent-mesh-codex`, `@toragonite/agent-mesh-gemini`). All five packages move in
+lockstep, so this package is bumped to 0.1.4 with the rest.
+
 ## 0.1.3
 
 Additive: what a host needs to drive a coding agent as a series of headless **turns** that

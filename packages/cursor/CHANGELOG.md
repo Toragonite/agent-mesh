@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+No changes in this package. All five packages move in lockstep; this release carries a Claude MCP
+status surface, a Codex spawn seam and an Antigravity usage-read fix (see their changelogs).
+
 ## 0.1.3
 
 The turn lane. Measured on cursor-agent 2026.10.14.

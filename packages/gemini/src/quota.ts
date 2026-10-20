@@ -27,7 +27,7 @@
  * direct child_process call here would start a process the host cannot track.
  */
 import { chmod, lstat, mkdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { QuotaSnapshot, QuotaWindow } from '@toragonite/agent-mesh';
 import type { ExecFn } from './exec.js';
@@ -36,8 +36,46 @@ import { isRecord, pickLastJsonObject } from './parse.js';
 /** The argv of the usage read, verbatim. The slash command is the VALUE of `-p`. */
 export const USAGE_ARGS: readonly string[] = ['-p', '/usage', '--output-format', 'json'];
 
-/** The private working directory's name under the OS temp dir. */
+/**
+ * The PREFIX of the private working directory's name under the OS temp dir. Since 0.1.4 the
+ * directory itself is per user — see {@link usageDirName} — so another local user who creates
+ * the shared name in a shared `/tmp` first (or simply ran their own reads) no longer blocks
+ * this user's usage reads.
+ */
 export const USAGE_DIR_NAME = 'agent-mesh-agy-usage';
+
+/** The longest username suffix kept on a platform without `process.getuid` (Windows). */
+const MAX_USER_SUFFIX_CHARS = 64;
+
+/**
+ * The private working directory's name for THIS user (since 0.1.4):
+ * `agent-mesh-agy-usage-<uid>` where `process.getuid` exists (POSIX); elsewhere
+ * `agent-mesh-agy-usage-<username>`, the OS username with every character outside
+ * `[A-Za-z0-9._-]` replaced by `_` and cut to 64 characters — `user` when it is unavailable
+ * or blank. Always a single path component. Never throws.
+ */
+export function usageDirName(): string {
+  if (typeof process.getuid === 'function') {
+    try {
+      const uid = process.getuid();
+      if (Number.isSafeInteger(uid) && uid >= 0) return `${USAGE_DIR_NAME}-${uid}`;
+    } catch {
+      // fall through to the username
+    }
+  }
+  let name = '';
+  try {
+    name = userInfo().username;
+  } catch {
+    name = '';
+  }
+  const safe = (typeof name === 'string' ? name : '')
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .slice(0, MAX_USER_SUFFIX_CHARS);
+  // A name of dots only ('.', '..') is a real path component of its own; keep the suffix opaque.
+  const suffix = safe === '' || /^\.+$/.test(safe) ? 'user' : safe;
+  return `${USAGE_DIR_NAME}-${suffix}`;
+}
 
 /**
  * Stdout cap. The real answer is well under 4 KiB; anything past 1 MiB is not a usage
@@ -69,17 +107,18 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}
  */
 const ERROR_LINE = /^\s*(AGY_ERROR:|error:)/im;
 
-/** The fixed private working directory: `<os tmpdir>/agent-mesh-agy-usage`. */
+/** The per-user private working directory: `<os tmpdir>/agent-mesh-agy-usage-<uid>` ({@link usageDirName}). */
 export function usageCwd(): string {
-  return join(tmpdir(), USAGE_DIR_NAME);
+  return join(tmpdir(), usageDirName());
 }
 
 /**
  * Make `dir` (0700) if absent, then make sure it is PRIVATE before agy runs in it.
  *
  * agy treats its working directory as a workspace, and on Linux the OS temp dir is the
- * shared `/tmp`: another local user could create this fixed path first and fill it with
- * workspace configuration. So the directory is used only when it is a real directory
+ * shared `/tmp`: another local user could create this path first and fill it with
+ * workspace configuration. (The per-user name means no OTHER user's own reads ever create
+ * it; a user who pre-creates it deliberately still only makes this user's read refuse.) So the directory is used only when it is a real directory
  * (not a symlink), owned by this process's user, with mode exactly 0700 — a directory
  * we own with other bits (0755, say) is set to 0700; anything else resolves false and the
  * read resolves `null` without spawning. (Ownership and mode bits are not consulted on

@@ -212,8 +212,10 @@ const snap = await new GeminiAdapter().quota();
   it), and its outcome — snapshot or `null` — is reused for `quotaCacheMs` (default 60 s; `0`
   turns the cache off). `quotaTimeoutMs` (default 90 s) kills the read's whole process group. The
   child is started through the adapter's `exec` seam, like `run()`, with the same account env,
-  stdin on `/dev/null`, and a private working directory, `<os tmpdir>/agent-mesh-agy-usage`
-  (created 0700; a path that is a symlink, owned by someone else, or not private is refused).
+  stdin on `/dev/null`, and a private per-user working directory,
+  `<os tmpdir>/agent-mesh-agy-usage-<uid>` (`-<username>`, sanitized, where there is no uid;
+  per user since 0.1.4) — created 0700; a path that is a symlink, owned by someone else, or not
+  private is refused.
   `Fleet.route()` calls `quota()`, so a cold read adds that boot time to routing — keep one
   adapter instance alive to benefit from the cache.
 - **Which login** — every account reports the usage of agy's **default** login; see

@@ -34,6 +34,7 @@ and is overridable for testing:
 | `quotaTimeoutMs` | `number` | `10000` | Deadline for the quota fetch. |
 | `modelsTimeoutMs` | `number` | `15000` | Deadline for the `codex app-server` model listing; its process group is killed at it. |
 | `modelsCacheMs` | `number` | `60000` | How long a failed listing returns the static catalog before the CLI is asked again. |
+| `spawn` | `SpawnFn` | `child_process.spawn` | Process-spawn seam for the `codex app-server` model listing (since 0.1.4). With the default, a failure or the deadline kills the app-server's process group; an injected spawner's child is killed by itself only. |
 
 ## Run and resume
 
@@ -95,6 +96,15 @@ live answer from the fallback:
 import { fetchLiveModels } from '@toragonite/agent-mesh-codex'
 const live = await fetchLiveModels({ codexHome: '/path/to/codex-home' }) // [] on any failure
 ```
+
+The listing is the one process `exec` does not start, so it has its own seam
+(since 0.1.4): `spawn` on the adapter options and on `fetchLiveModels()`'s
+options, typed `SpawnFn` — the shape of `child_process.spawn`, which is the
+default. It is called once as `spawn(binary, ['app-server'], options)` and must
+return a child with `stdin`/`stdout`/`stderr` pipes (`SpawnedChild`). A host's
+hermetic tests can answer the protocol from an in-memory fake; an injected
+child is killed with `child.kill('SIGKILL')` on a failure or at the deadline,
+never by process group.
 
 Both lists are gated the same way. Under a ChatGPT login only the universal models
 are selectable; `gpt-5.1-codex-max` and `gpt-5.2` require an API key. When logged

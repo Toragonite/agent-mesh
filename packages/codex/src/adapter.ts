@@ -52,6 +52,7 @@ import {
   gateModel,
 } from './models.js';
 import { resolveAuthStatus, resolveCodexHome, type ReadTextFile } from './auth.js';
+import type { SpawnFn } from './app-server.js';
 import { readQuota } from './quota.js';
 
 export interface CodexAdapterOptions {
@@ -91,6 +92,13 @@ export interface CodexAdapterOptions {
    * never spawns a process on every call.
    */
   modelsCacheMs?: number;
+  /**
+   * Process-spawn seam for the `codex app-server` model listing behind `availableModels()`
+   * (since 0.1.4), the shape of `child_process.spawn`. Defaults to a real `child_process.spawn`,
+   * whose process group is killed on a failure or at `modelsTimeoutMs`; an injected spawner's
+   * child is killed by itself only. The `exec` / `lineStream` seams never reach the listing.
+   */
+  spawn?: SpawnFn;
   /**
    * Since 0.1.3: pass `--skip-git-repo-check` on every run that STARTS a thread (never on a
    * resume), so codex runs in a directory that is not a git checkout. Default false.
@@ -336,6 +344,8 @@ export class CodexAdapter implements Adapter {
   private readonly modelsTimeoutMs: number;
   private readonly modelsCacheMs: number;
   private readonly skipGitRepoCheck: boolean;
+  /** The app-server spawn seam; undefined = the default spawner (group kill). */
+  private readonly spawnFn: SpawnFn | undefined;
 
   /** Successful live listings, per resolved CODEX_HOME (memoized for the instance's life). */
   private readonly liveModels = new Map<string, ModelInfo[]>();
@@ -356,6 +366,7 @@ export class CodexAdapter implements Adapter {
     this.modelsTimeoutMs = opts.modelsTimeoutMs ?? DEFAULT_LIVE_MODELS_TIMEOUT_MS;
     this.modelsCacheMs = opts.modelsCacheMs ?? DEFAULT_MODELS_CACHE_MS;
     this.skipGitRepoCheck = opts.skipGitRepoCheck === true;
+    this.spawnFn = opts.spawn;
   }
 
   async authStatus(account?: Account): Promise<AuthStatus> {
@@ -391,6 +402,7 @@ export class CodexAdapter implements Adapter {
         codexHome: home,
         env: this.env,
         timeoutMs: this.modelsTimeoutMs,
+        ...(this.spawnFn !== undefined ? { spawn: this.spawnFn } : {}),
       })
         .then((models) => {
           if (models.length > 0) {

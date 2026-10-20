@@ -198,9 +198,11 @@ const snap = await new GeminiAdapter().quota()
   (`quotaCacheMs`; `0` turns the cache off). Per adapter instance and per
   account at most **one** read runs at a time (a concurrent caller waits for
   it). The child is started through the adapter's `exec` seam with the same
-  account env as `run()`, stdin on `/dev/null`, and a private working directory,
-  `<os tmpdir>/agent-mesh-agy-usage` (created `0700`; refused when it is not
-  private).
+  account env as `run()`, stdin on `/dev/null`, and a private per-user working
+  directory, `<os tmpdir>/agent-mesh-agy-usage-<uid>` (on a platform without a
+  uid, `-<username>`, sanitized; since 0.1.4 — before, one name was shared by every
+  local user). It is created `0700` and refused — the read is `null`, nothing is
+  spawned — when it is not a real directory owned by this user with mode `0700`.
 
 ::: warning Account isolation is not provided
 `agy` 1.3.5 does not read `AGY_HOME`, so every account — including the one

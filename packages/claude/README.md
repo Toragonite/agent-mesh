@@ -100,6 +100,13 @@ const turn = claude.stream(
   `system/init`) as `{ type: 'session', conversationId }` — once, and again only if a later line
   reports a different id. It is never synthesized from `sessionId` or `resumeId`. The stream ends
   with exactly one `done` or `error`.
+- **MCP server status (since 0.1.4).** The `mcp_servers` of Claude Code's `system/init` line —
+  `[{ name, status }]`, status e.g. `connected`, `failed`, `needs-auth`, `pending` — rides as
+  `mcpServers` on the `session` event that line emits and on the `done` result
+  (`RunResult.mcpServers`, also when an earlier line had already reported the session). Only a
+  well-formed list is taken (objects with non-blank string `name`/`status`, trimmed and cut to 200
+  characters, the first 64 entries); anything else leaves the field absent and never fails the run.
+  `parseInitMcpServers(event)` applies the same check to a line you parsed yourself.
 - **`RunOptions.lineStream`** is the only seam the run spawns through (`run()` drains it to
   completion). **`RunOptions.env`** is the child's whole environment, used verbatim: the adapter
   sets no `CLAUDE_CONFIG_DIR` of its own and does not fall back to the `env` seam's or the

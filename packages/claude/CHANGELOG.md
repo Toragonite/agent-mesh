@@ -3,6 +3,21 @@
 All notable changes to **@toragonite/agent-mesh-claude** are documented here. This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4]
+
+- **MCP server status from `system/init`:** `stream()` now surfaces the `mcp_servers` list that
+  Claude Code's init line carries — `[{ name, status }]`, status e.g. `connected`, `failed`,
+  `needs-auth`, `pending` — as `mcpServers` on the `session` event that line emits and on the
+  `done` result (`RunResult.mcpServers`; also when an earlier line had already reported the
+  session, e.g. a hook line). The list is taken only when it is well-formed: an array of objects
+  with a non-blank string `name` and `status` (trimmed, each cut to 200 characters; the first 64
+  entries kept, the rest dropped). Anything else — not an array, an entry without a name, a
+  non-string status — leaves the field absent; it never fails or changes the run. An empty list
+  stays `[]`. `run()` (single JSON output, no init line) is unchanged.
+- **`parseInitMcpServers(event)`** is exported: the same validation for a host that reads
+  stream-json itself.
+- Requires `@toragonite/agent-mesh` ^0.1.4 (the `McpServerStatus` type).
+
 ## [0.1.3]
 
 The turn lane: `run()` and `stream()` start a conversation under a chosen id, continue one, and

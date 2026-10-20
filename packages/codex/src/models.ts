@@ -17,7 +17,7 @@
  * `--model` and the CLI applies its own default.
  */
 import type { AuthStatus, LatencyClass, ModelInfo } from '@toragonite/agent-mesh';
-import { listAppServerModels } from './app-server.js';
+import { listAppServerModels, type SpawnFn } from './app-server.js';
 import { resolveCodexHome } from './auth.js';
 import { PACKAGE_VERSION } from './version.js';
 
@@ -227,6 +227,13 @@ export interface FetchLiveModelsOptions {
    * AND exit by itself on stdin close within it, or its process group is killed.
    */
   timeoutMs?: number;
+  /**
+   * Spawn seam (since 0.1.4), the shape of `child_process.spawn` — which is the default. Called
+   * once as `spawn(binary, ['app-server'], options)`. With the default a failure or the deadline
+   * kills the app-server's whole process group; with an injected spawner only the child it
+   * returned is killed (`child.kill('SIGKILL')`).
+   */
+  spawn?: SpawnFn;
 }
 
 /**
@@ -251,6 +258,7 @@ export async function fetchLiveModels(opts: FetchLiveModelsOptions = {}): Promis
       env: appServerEnv(base, codexHome),
       timeoutMs,
       clientVersion: PACKAGE_VERSION,
+      ...(opts.spawn !== undefined ? { spawn: opts.spawn } : {}),
     });
     return entries ? mapLiveModels(entries) : [];
   } catch {

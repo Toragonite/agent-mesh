@@ -270,6 +270,19 @@ export interface InteractiveResumeSpec {
   verified: boolean;
 }
 
+/**
+ * Since 0.1.4. One MCP server's connection state as the vendor's own stream reported it at the
+ * start of a run (Claude Code's `system/init` → `mcp_servers[]`). `status` is the vendor's word,
+ * verbatim but trimmed — e.g. `connected`, `failed`, `needs-auth`, `pending` — so a consumer must
+ * treat an unknown value as "not known to be connected".
+ */
+export interface McpServerStatus {
+  /** The server's configured name (trimmed, at most 200 characters). */
+  name: string;
+  /** The vendor's status word (trimmed, at most 200 characters). */
+  status: string;
+}
+
 export interface RunResult {
   vendor: Vendor;
   /**
@@ -287,6 +300,12 @@ export interface RunResult {
   note?: string;
   /** Raw final vendor event/payload for debugging. */
   raw?: unknown;
+  /**
+   * Since 0.1.4, on a streamed run's `done` result. The MCP servers' status from the run's
+   * session-start event (Claude Code's `system/init` `mcp_servers`, at most 64 entries). Absent
+   * when the vendor reported none or a malformed list; `[]` when it reported an empty one.
+   */
+  mcpServers?: ReadonlyArray<McpServerStatus>;
 }
 
 export interface ResumeOptions {
@@ -310,7 +329,12 @@ export type RunEvent =
    * `conversation_id`) — never synthesized from `sessionId` or `resumeId`. Emitted when the stream
    * first reports an id, and again only if it later reports a different one. A resumed run whose
    * `session` id differs from its `resumeId` continued in a NEW conversation.
+   *
+   * Since 0.1.4, `mcpServers`: the MCP servers' status when the line that reports the id is the
+   * vendor's session-start event and carries a well-formed list (Claude Code's `system/init`
+   * `mcp_servers`). Absent otherwise — the `done` result carries it too, so a list whose init line
+   * did not open the session (an earlier line already reported the id) is not lost.
    */
-  | { type: 'session'; conversationId: string }
+  | { type: 'session'; conversationId: string; mcpServers?: ReadonlyArray<McpServerStatus> }
   | { type: 'done'; result: RunResult }
   | { type: 'error'; message: string };

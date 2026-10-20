@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.4
+
+- **Per-user usage working directory:** `quota()` ran `agy -p /usage` in
+  `<os tmpdir>/agent-mesh-agy-usage`, one name for every local user. On Linux with `TMPDIR` unset
+  that is the shared `/tmp`, so a directory another user had created there (by running their own
+  reads, or deliberately) was — correctly — refused as not private, and this user's `quota()` was
+  `null` for good. The directory is now per user: `agent-mesh-agy-usage-<uid>`, or, where the
+  platform has no uid (Windows), `agent-mesh-agy-usage-<username>` (characters outside
+  `[A-Za-z0-9._-]` replaced by `_`, at most 64; `user` when there is none). The privacy checks are
+  unchanged: a real directory, not a symlink, owned by this user, mode `0700` — otherwise the read
+  is `null` and nothing is spawned.
+
 ## 0.1.3
 
 The turn lane. Measured on agy 1.3.6.

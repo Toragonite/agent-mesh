@@ -31,6 +31,7 @@ import {
   type AuthStatus,
   type InteractiveResumeSpec,
   type McpAttachment,
+  type McpServerStatus,
   type ModelInfo,
   type QuotaSnapshot,
   type QuotaWindow,
@@ -183,6 +184,67 @@ function mapUsage(raw: unknown): TokenUsage | undefined {
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
   }
   return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+/** At most this many `mcp_servers` entries are kept (and checked) from a `system/init` line. */
+export const MAX_INIT_MCP_SERVERS = 64;
+/** A kept `mcp_servers` name/status is trimmed and cut to this many characters (code points). */
+export const MAX_INIT_MCP_FIELD_CHARS = 200;
+
+/** Trimmed and cut to {@link MAX_INIT_MCP_FIELD_CHARS} code points; `undefined` when not a non-blank string. */
+function initMcpField(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (trimmed === '') {
+    return undefined;
+  }
+  const chars = Array.from(trimmed);
+  return chars.length > MAX_INIT_MCP_FIELD_CHARS ? chars.slice(0, MAX_INIT_MCP_FIELD_CHARS).join('').trimEnd() : trimmed;
+}
+
+/**
+ * The `mcp_servers` of a stream-json `{"type":"system","subtype":"init"}` line (since 0.1.4), or
+ * `undefined`. Accepted ONLY as an array whose kept entries — the first
+ * {@link MAX_INIT_MCP_SERVERS}; the rest are dropped unchecked — are all objects with a non-blank
+ * string `name` and `status` (trimmed, cut to {@link MAX_INIT_MCP_FIELD_CHARS}; other keys ignored).
+ * Anything else (not an array, a non-object entry, a missing/blank/non-string name or status)
+ * yields `undefined`: a partly-read list would misreport which servers exist. `[]` stays `[]`.
+ * Returns fresh objects; never throws.
+ */
+export function parseInitMcpServers(event: unknown): McpServerStatus[] | undefined {
+  try {
+    if (!isRecord(event) || event.type !== 'system' || event.subtype !== 'init') {
+      return undefined;
+    }
+    const list = event.mcp_servers;
+    if (!Array.isArray(list)) {
+      return undefined;
+    }
+    const out: McpServerStatus[] = [];
+    const n = Math.min(list.length, MAX_INIT_MCP_SERVERS);
+    for (let i = 0; i < n; i++) {
+      const entry: unknown = list[i];
+      if (!isRecord(entry)) {
+        return undefined;
+      }
+      const name = initMcpField(entry.name);
+      const status = initMcpField(entry.status);
+      if (name === undefined || status === undefined) {
+        return undefined;
+      }
+      out.push({ name, status });
+    }
+    return out;
+  } catch {
+    return undefined; // a hostile getter/proxy can never break the stream
+  }
+}
+
+/** A fresh copy of a parsed list, so no two consumers share (or can corrupt) one array. */
+function copyMcpServers(list: readonly McpServerStatus[]): McpServerStatus[] {
+  return list.map((s) => ({ name: s.name, status: s.status }));
 }
 
 /** A string field off a parsed record, or `undefined` when absent/non-string. */
@@ -612,6 +674,11 @@ export class ClaudeAdapter implements Adapter {
    * emits a `session` event with that id — the CLI's own report, never `task.sessionId` or
    * `task.resumeId` echoed back — and a later line with a DIFFERENT id emits another.
    *
+   * MCP status (since 0.1.4): the first `system/init` line's `mcp_servers` (see
+   * {@link parseInitMcpServers}) rides on the `session` event that line emits, and on the `done`
+   * result (`RunResult.mcpServers`) — also when an earlier line had already reported the session.
+   * A missing or malformed list leaves both absent; it never fails the run.
+   *
    * Turn lane (since 0.1.3), in argv order: `resumeId` → `--resume <id>`, `sessionId` →
    * `--session-id <uuid>`, `model` → `--model`, `permissionMode` → `--permission-mode` (on every
    * run, resumed or not), `unattended` → `--permission-prompts none`, `settingSources` →
@@ -661,6 +728,8 @@ export class ClaudeAdapter implements Adapter {
     let sessionId = '';
     let reportedSession = '';
     let seenModel: string | undefined;
+    // The first well-formed `system/init` `mcp_servers` of this run (since 0.1.4).
+    let mcpServers: McpServerStatus[] | undefined;
     let textSoFar = '';
     let emittedDone = false;
     let endMeta: StreamEndMeta | undefined;
@@ -693,12 +762,18 @@ export class ClaudeAdapter implements Adapter {
         if (!isRecord(event)) {
           continue;
         }
+        const initServers = mcpServers === undefined ? parseInitMcpServers(event) : undefined;
+        if (initServers !== undefined) {
+          mcpServers = initServers;
+        }
         const eventSession = str(event, 'session_id');
         if (eventSession) {
           sessionId = eventSession;
           if (eventSession !== reportedSession) {
             reportedSession = eventSession;
-            yield { type: 'session', conversationId: eventSession };
+            yield initServers !== undefined
+              ? { type: 'session', conversationId: eventSession, mcpServers: copyMcpServers(initServers) }
+              : { type: 'session', conversationId: eventSession };
           }
         }
         const eventModel = str(event, 'model');
@@ -737,6 +812,7 @@ export class ClaudeAdapter implements Adapter {
             usage,
             ...(note ? { note } : {}),
             raw: event,
+            ...(mcpServers !== undefined ? { mcpServers: copyMcpServers(mcpServers) } : {}),
           };
           emittedDone = true;
           yield { type: 'done', result };
@@ -763,6 +839,7 @@ export class ClaudeAdapter implements Adapter {
           status: 'incomplete',
           ...(note ? { note } : {}),
           model: model ?? seenModel,
+          ...(mcpServers !== undefined ? { mcpServers: copyMcpServers(mcpServers) } : {}),
         },
       };
       return;

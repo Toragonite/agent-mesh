@@ -92,7 +92,7 @@ function alive(pid: number): boolean {
 }
 
 /** Poll until `pid` is gone (an orphaned grandchild is reaped by init, not by us). */
-async function gone(pid: number, withinMs = 3000): Promise<boolean> {
+async function gone(pid: number, withinMs = 8_000): Promise<boolean> {
   const end = Date.now() + withinMs;
   while (Date.now() < end) {
     if (!alive(pid)) return true;
@@ -147,6 +147,14 @@ const TWO_PAGES_MODELS = [
 ];
 
 const STATIC_IDS = STATIC_MODELS.map((m) => m.id);
+/**
+ * Wall-clock budgets. Every bound below only guards against a hang (or proves which path ended
+ * a session), so each is generous: a loaded CI box must not flake them.
+ */
+const SLOW_TEST_MS = 30_000; // per-test timeout for tests that spawn fakes or wait on a deadline
+/** A failure that must end the session AT ONCE: the deadline is far above the bound. */
+const AT_ONCE_DEADLINE_MS = 20_000;
+const AT_ONCE_BOUND_MS = 8_000;
 const API_KEY_ENV = { OPENAI_API_KEY: 'sk-test-not-real' };
 const CHATGPT_AUTH = JSON.stringify({ tokens: { access_token: 'fake-token' } });
 
@@ -214,14 +222,14 @@ onMessage = (m) => {
   if (m.method === 'initialize') send({ id: m.id, result: INIT_RESULT });
   else if (m.method === 'model/list') send({ id: m.id, error: { code: -32603, message: 'internal error' } });
 };`);
-      const a = new CodexAdapter({ exec: noExec, binary: fake.bin, env: API_KEY_ENV, modelsTimeoutMs: 10_000 });
+      const a = new CodexAdapter({ exec: noExec, binary: fake.bin, env: API_KEY_ENV, modelsTimeoutMs: AT_ONCE_DEADLINE_MS });
       const start = Date.now();
       expect((await a.availableModels()).map((m) => m.id)).toEqual(STATIC_IDS);
-      expect(Date.now() - start).toBeLessThan(5_000); // failed at once, not at the deadline
+      expect(Date.now() - start).toBeLessThan(AT_ONCE_BOUND_MS); // failed at once, not at the deadline
       expect(await gone(fake.pids()[0]!)).toBe(true);
       expect(await fetchLiveModels({ binary: fakeAppServer(`
 onMessage = (m) => { if (m.method === 'initialize') send({ id: m.id, error: { code: -32600, message: 'bad' } }); };`).bin, env: {} })).toEqual([]);
-    });
+    }, SLOW_TEST_MS);
 
     it('a JSON-RPC error with a null id (parse error) also ends it', async () => {
       const fake = fakeAppServer(`
@@ -229,7 +237,7 @@ onEof = () => {}; setInterval(() => {}, 1000);
 onMessage = () => send({ id: null, error: { code: -32700, message: 'parse error' } });`);
       expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: 10_000 })).toEqual([]);
       expect(await gone(fake.pids()[0]!)).toBe(true);
-    });
+    }, SLOW_TEST_MS);
 
     it('malformed lines → the static list at once, and the process is gone', async () => {
       const answers = [
@@ -244,11 +252,11 @@ onMessage = () => send({ id: null, error: { code: -32700, message: 'parse error'
 onEof = () => {}; setInterval(() => {}, 1000);
 onMessage = (m) => { if (m.method === 'initialize') ${answer}; };`);
         const start = Date.now();
-        expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: 10_000 })).toEqual([]);
-        expect(Date.now() - start).toBeLessThan(5_000);
+        expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: AT_ONCE_DEADLINE_MS })).toEqual([]);
+        expect(Date.now() - start).toBeLessThan(AT_ONCE_BOUND_MS);
         expect(await gone(fake.pids()[0]!)).toBe(true);
       }
-    });
+    }, SLOW_TEST_MS);
 
     it('a result of the wrong shape → the static list', async () => {
       const shapes = [
@@ -263,23 +271,25 @@ onMessage = (m) => { if (m.method === 'initialize') ${answer}; };`);
         expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: 10_000 })).toEqual([]);
         expect(await gone(fake.pids()[0]!)).toBe(true);
       }
-    });
+    }, SLOW_TEST_MS);
 
     it('never answers → the static list at the timeout; it and its child process are gone', async () => {
       const fake = fakeAppServer(`
 const child = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
 log({ kind: 'grandchild', pid: child.pid });
 onEof = () => {}; setInterval(() => {}, 1000);`);
-      const a = new CodexAdapter({ exec: noExec, binary: fake.bin, env: API_KEY_ENV, modelsTimeoutMs: 400 });
+      // Budgets are generous so a loaded machine cannot flake them; the bounds only prove that
+      // the deadline (not something earlier) ended it, and that nothing hung past it.
+      const a = new CodexAdapter({ exec: noExec, binary: fake.bin, env: API_KEY_ENV, modelsTimeoutMs: 3_000 });
       const start = Date.now();
       expect((await a.availableModels()).map((m) => m.id)).toEqual(STATIC_IDS);
       const elapsed = Date.now() - start;
-      expect(elapsed).toBeGreaterThanOrEqual(350);
-      expect(elapsed).toBeLessThan(4_000);
+      expect(elapsed).toBeGreaterThanOrEqual(2_550); // ≥ 0.85 × the budget
+      expect(elapsed).toBeLessThan(8_000);
       expect(await gone(fake.pids()[0]!)).toBe(true);
       const grandchild = fake.events().find((e) => e.kind === 'grandchild')!.pid as number;
       expect(await gone(grandchild)).toBe(true); // the whole process group was killed
-    });
+    }, SLOW_TEST_MS);
 
     it('answers but does not exit on stdin close → killed at the timeout, the static list', async () => {
       const fake = fakeAppServer(`
@@ -287,12 +297,14 @@ ${pagedServer(TWO_PAGES)}
 onEof = () => { log({ kind: 'ignoring-eof' }); };
 setInterval(() => {}, 1000);`);
       const start = Date.now();
-      expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: 600 })).toEqual([]);
-      expect(Date.now() - start).toBeLessThan(4_000);
+      expect(await fetchLiveModels({ binary: fake.bin, env: {}, timeoutMs: 3_000 })).toEqual([]);
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeGreaterThanOrEqual(2_550); // ≥ 0.85 × the budget: the deadline ended it
+      expect(elapsed).toBeLessThan(8_000);
       const kinds = fake.events().map((e) => e.kind);
       expect(kinds).toContain('ignoring-eof'); // stdin WAS closed — the server just would not go
       expect(await gone(fake.pids()[0]!)).toBe(true);
-    });
+    }, SLOW_TEST_MS);
 
     it('an exit before the listing ends, or a non-zero exit after it → the static list', async () => {
       const early = fakeAppServer(`onMessage = (m) => { if (m.method === 'initialize') process.exit(0); };`);
@@ -301,7 +313,7 @@ setInterval(() => {}, 1000);`);
       const nonZero = fakeAppServer(`${pagedServer(TWO_PAGES)}\nonEof = () => process.exit(3);`);
       expect(await fetchLiveModels({ binary: nonZero.bin, env: {} })).toEqual([]);
       expect(nonZero.events().at(-1)).toMatchObject({ kind: 'exit', code: 3 });
-    });
+    }, SLOW_TEST_MS);
 
     it('a spawn error (no such binary) → the static list, never a throw', async () => {
       const a = new CodexAdapter({ exec: noExec, binary: '/nonexistent/agent-mesh-test/codex', env: API_KEY_ENV });
@@ -311,7 +323,7 @@ setInterval(() => {}, 1000);`);
       dirs.push(join(notExecutable, '..'));
       writeFileSync(notExecutable, 'not a program');
       expect(await fetchLiveModels({ binary: notExecutable, env: {} })).toEqual([]);
-    });
+    }, SLOW_TEST_MS);
 
     it('follows nextCursor for at most 10 pages', async () => {
       const fake = fakeAppServer(`
